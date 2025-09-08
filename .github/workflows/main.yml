@@ -1,0 +1,43 @@
+name: Daily Car Scraping
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        pip install --upgrade pip
+        pip install -r requirements.txt
+        playwright install chromium
+    
+    - name: Configure AWS
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ secrets.AWS_REGION }}
+    
+    - name: Run scrapers
+      run: |
+        python cnb_scraper.py || echo "CNB scraper had issues"
+        sleep 30
+        python bat_scraper.py || echo "BAT scraper had issues"
+        
+        # Upload any CSV files created
+        for file in *.csv; do
+          [ -f "$file" ] && aws s3 cp "$file" s3://my-mii-reports/
+        done
