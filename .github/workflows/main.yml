@@ -78,9 +78,17 @@ jobs:
         echo "✅ BAT scraper completed successfully"
       continue-on-error: true
     
+    - name: Run Mii Calculations
+      run: |
+        export DISPLAY=:99
+        echo "🧮 Starting Mii calculations..."
+        python enhanced_mii_all_models.py
+        echo "✅ Mii calculations completed successfully"
+      continue-on-error: true
+    
     - name: Upload CSV files to S3
       run: |
-        echo "☁️ Uploading CSV files to S3..."
+        echo "☁️ Uploading all CSV files to S3..."
         uploaded_count=0
         
         for file in *.csv; do
@@ -95,15 +103,28 @@ jobs:
           fi
         done
         
+        # Also upload JSON reports if they exist
+        for file in *.json; do
+          if [ -f "$file" ]; then
+            echo "📄 Uploading JSON: $file"
+            if aws s3 cp "$file" s3://my-mii-reports/; then
+              echo "✅ Successfully uploaded: $file"
+              uploaded_count=$((uploaded_count + 1))
+            else
+              echo "❌ Failed to upload: $file"
+            fi
+          fi
+        done
+        
         if [ $uploaded_count -eq 0 ]; then
-          echo "⚠️ No CSV files found to upload"
+          echo "⚠️ No files found to upload"
         else
           echo "🎉 Uploaded $uploaded_count file(s) to S3"
         fi
         
         # List recent files in S3 bucket
         echo "📂 Recent files in S3 bucket:"
-        aws s3 ls s3://my-mii-reports/ --recursive | sort -k1,2 | tail -10
+        aws s3 ls s3://my-mii-reports/ --recursive | sort -k1,2 | tail -15
     
     - name: Upload artifacts (for debugging)
       uses: actions/upload-artifact@v3
