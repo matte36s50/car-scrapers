@@ -127,7 +127,7 @@ jobs:
         aws s3 ls s3://my-mii-reports/ --recursive | sort -k1,2 | tail -15
     
     - name: Upload artifacts (for debugging)
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: scraping-results
