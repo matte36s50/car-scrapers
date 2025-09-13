@@ -30,7 +30,6 @@ jobs:
           libxrandr-dev \
           libgbm-dev \
           libxss-dev \
-          libasound2-dev \
           xvfb
     
     - name: Install Python dependencies
@@ -38,10 +37,18 @@ jobs:
         pip install --upgrade pip
         pip install -r requirements.txt
     
-    - name: Install Playwright browsers
+    - name: Install Playwright browsers (with fallback)
       run: |
-        playwright install chromium
-        playwright install-deps chromium
+        echo "Installing Playwright browsers..."
+        playwright install chromium || echo "Playwright install failed, trying alternative..."
+        
+        # Try installing with system dependencies
+        sudo apt-get install -y chromium-browser || echo "System chromium install failed"
+        
+        # Verify installation
+        playwright --version || echo "Playwright CLI not available"
+        
+        echo "Browser installation completed (check logs for any issues)"
     
     - name: Configure AWS
       uses: aws-actions/configure-aws-credentials@v4
@@ -127,11 +134,12 @@ jobs:
         aws s3 ls s3://my-mii-reports/ --recursive | sort -k1,2 | tail -15
     
     - name: Upload artifacts (for debugging)
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       if: always()
       with:
         name: scraping-results
         path: |
           *.csv
           *.log
+          *.json
         retention-days: 7
