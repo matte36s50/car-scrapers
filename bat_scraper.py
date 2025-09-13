@@ -29,7 +29,7 @@ def upload_to_s3(file_name, bucket, object_name=None):
 BAT_SITEMAP_URL = "https://bringatrailer.com/sitemap_auctions.xml"
 OUTPUT_CSV = f"bat_data_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv"
 S3_BUCKET = "my-mii-reports"
-SLEEP_BETWEEN_AUCTIONS = 4.0  # Increased for cloud stability
+SLEEP_BETWEEN_AUCTIONS = 2.5  # Reduced from 4.0 to 2.5 seconds for efficiency
 
 # Known problematic URL patterns to skip
 SKIP_PATTERNS = [
@@ -280,9 +280,10 @@ def main():
         print("✅ No new BAT auctions found - all up to date!")
         return True
 
-    # Limit for cloud efficiency
-    new_urls = new_urls[:75]  # Process 75 at a time
+    # Increased limit to handle BAT's daily volume of 150+ auctions
+    new_urls = new_urls[:250]  # Process 250 at a time to cover daily volume plus catch-up
     print(f"🎯 Processing first {len(new_urls)} new auctions")
+    print(f"⏱️ Estimated time: {(len(new_urls) * SLEEP_BETWEEN_AUCTIONS) / 60:.1f} minutes delay + scraping time")
 
     # 4. Scrape new auctions
     with open(OUTPUT_CSV, 'w', newline='', encoding='utf-8') as csvfile:
@@ -300,7 +301,8 @@ def main():
                     "--no-sandbox",
                     "--disable-dev-shm-usage",
                     "--disable-web-security",
-                    "--disable-features=VizDisplayCompositor"
+                    "--disable-features=VizDisplayCompositor",
+                    "--disable-audio-output"  # Disable audio to avoid browser issues
                 ]
             )
             context = browser.new_context(
@@ -378,7 +380,7 @@ def main():
             print(f"✅ Completed auctions: {new_auctions}")
             print(f"⚡ Fast extractions: {fast_extractions}")
             print(f"❌ Failed: {failed_auctions}")
-            print(f"⏱️ Average time per auction: {(len(new_urls) * SLEEP_BETWEEN_AUCTIONS) / 60:.1f} minutes")
+            print(f"⏱️ Total processing time: ~{(len(new_urls) * SLEEP_BETWEEN_AUCTIONS) / 60:.1f} minutes")
 
     # 5. Upload to S3
     print(f"\n☁️ Uploading to S3...")
