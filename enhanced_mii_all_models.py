@@ -74,42 +74,61 @@ def get_instagram_estimates(all_models):
     return estimates
 
 def load_scraped_data():
-    """Load data from the scraped CSV files"""
-    print("🔍 Looking for scraped data files...")
+    """Load data from single bat.csv and cnb.csv files in S3"""
+    print("📋 Looking for scraped data in S3...")
     
-    # Look for the files created by our scrapers
-    bat_files = [f for f in os.listdir('.') if f.startswith('bat_data_') and f.endswith('.csv')]
-    cnb_files = [f for f in os.listdir('.') if f.startswith('cnb_data_') and f.endswith('.csv')]
-    
-    print(f"Found BAT files: {bat_files}")
-    print(f"Found CNB files: {cnb_files}")
-    
+    s3 = boto3.client('s3')
     all_data = []
     
-    # Load BAT data
-    for bat_file in bat_files:
-        try:
-            print(f"📊 Loading BAT data from {bat_file}")
-            df = pd.read_csv(bat_file)
+    # Load BAT data from S3
+    try:
+        print(f"📊 Downloading bat.csv from S3...")
+        s3.download_file('my-mii-reports', 'bat.csv', 'temp_bat.csv')
+        df = pd.read_csv('temp_bat.csv')
+        df['data_source'] = 'BAT'
+        
+        # Standardize column names for MII calculation
+        if 'model' not in df.columns and 'title' in df.columns:
+            df['model'] = df['title']
+        elif 'model' not in df.columns and 'auction_url' in df.columns:
+            # Extract model from URL if needed
+            df['model'] = df['auction_url'].str.extract(r'/listing/([^/]+)$')[0]
+        
+        all_data.append(df)
+        print(f"  ✅ Loaded {len(df)} BAT records")
+        
+        # Clean up temp file
+        os.remove('temp_bat.csv')
+        
+    except Exception as e:
+        print(f"  ⚠️ Could not load bat.csv from S3: {e}")
+        # Try local file as fallback
+        if os.path.exists('bat.csv'):
+            df = pd.read_csv('bat.csv')
             df['data_source'] = 'BAT'
-            # Standardize column names
-            if 'title' in df.columns and 'model' not in df.columns:
-                df['model'] = df['title']
             all_data.append(df)
-            print(f"  ✅ Loaded {len(df)} BAT records")
-        except Exception as e:
-            print(f"  ❌ Error loading {bat_file}: {e}")
+            print(f"  ✅ Loaded {len(df)} BAT records from local file")
     
-    # Load CNB data  
-    for cnb_file in cnb_files:
-        try:
-            print(f"📊 Loading CNB data from {cnb_file}")
-            df = pd.read_csv(cnb_file)
+    # Load CNB data from S3
+    try:
+        print(f"📊 Downloading cnb.csv from S3...")
+        s3.download_file('my-mii-reports', 'cnb.csv', 'temp_cnb.csv')
+        df = pd.read_csv('temp_cnb.csv')
+        df['data_source'] = 'CNB'
+        all_data.append(df)
+        print(f"  ✅ Loaded {len(df)} CNB records")
+        
+        # Clean up temp file
+        os.remove('temp_cnb.csv')
+        
+    except Exception as e:
+        print(f"  ⚠️ Could not load cnb.csv from S3: {e}")
+        # Try local file as fallback
+        if os.path.exists('cnb.csv'):
+            df = pd.read_csv('cnb.csv')
             df['data_source'] = 'CNB'
             all_data.append(df)
-            print(f"  ✅ Loaded {len(df)} CNB records")
-        except Exception as e:
-            print(f"  ❌ Error loading {cnb_file}: {e}")
+            print(f"  ✅ Loaded {len(df)} CNB records from local file")
     
     if not all_data:
         print("❌ No scraped data found!")
@@ -118,6 +137,8 @@ def load_scraped_data():
     # Combine all data
     combined_df = pd.concat(all_data, ignore_index=True, sort=False)
     print(f"📈 Combined total: {len(combined_df)} auction records")
+    print(f"   BAT records: {len(combined_df[combined_df['data_source'] == 'BAT'])}")
+    print(f"   CNB records: {len(combined_df[combined_df['data_source'] == 'CNB'])}")
     
     return combined_df
 
@@ -135,36 +156,78 @@ def clean_and_process_data(df):
     df['model'] = df['model'].astype(str).str.strip()
     df = df[df['model'] != 'nan']
     df = df[df['model'] != '']
+    df = df[df['model'].notna()]
     
     # Extract numeric values from text fields
     def extract_number(val):
         if pd.isna(val):
             return 0
+        # Handle both string and numeric inputs
+        if isinstance(val, (int, float)):
+            return int(val)
         matches = re.findall(r'\d+', str(val).replace(',', ''))
         return int(matches[0]) if matches else 0
     
     df['views_numeric'] = df['views'].apply(extract_number)
     df['bids_numeric'] = df['bids'].apply(extract_number)
     
-    # Add basic date parsing
+    # Handle comments if the column exists
+    if 'comments' in df.columns:
+        df['comments_numeric'] = df['comments'].apply(extract_number)
+    else:
+        df['comments_numeric'] = 0
+    
+    # Add quarter information
     if 'scraped_date' in df.columns:
         df['quarter'] = pd.to_datetime(df['scraped_date'], errors='coerce').dt.to_period('Q').astype(str)
+    elif 'sale_date' in df.columns:
+        df['quarter'] = pd.to_datetime(df['sale_date'], errors='coerce').dt.to_period('Q').astype(str)
     else:
-        df['quarter'] = f"{datetime.datetime.now().year}Q{(datetime.datetime.now().month-1)//3 + 1}"
+        current_quarter = f"{datetime.datetime.now().year}Q{(datetime.datetime.now().month-1)//3 + 1}"
+        df['quarter'] = current_quarter
     
-    # Extract year from model name (basic)
-    def extract_year(model):
-        matches = re.findall(r'\b(19|20)\d{2}\b', str(model))
-        if matches:
-            year = int(matches[0])
-            if 1900 <= year <= datetime.datetime.now().year + 2:
-                return year
+    # Extract year from multiple possible sources
+    def extract_year(row):
+        # Try year column first
+        if 'year' in row and pd.notna(row['year']):
+            try:
+                year = int(row['year'])
+                if 1900 <= year <= datetime.datetime.now().year + 2:
+                    return year
+            except:
+                pass
+        
+        # Try extracting from model name
+        if 'model' in row and pd.notna(row['model']):
+            matches = re.findall(r'\b(19|20)\d{2}\b', str(row['model']))
+            if matches:
+                year = int(matches[0])
+                if 1900 <= year <= datetime.datetime.now().year + 2:
+                    return year
+        
         return None
     
-    df['year'] = df['model'].apply(extract_year)
+    df['year'] = df.apply(extract_year, axis=1)
     df['car_age'] = datetime.datetime.now().year - df['year'].fillna(datetime.datetime.now().year)
     
+    # Extract sale amounts if present
+    if 'sale_amount' in df.columns:
+        def extract_sale_amount(val):
+            if pd.isna(val):
+                return 0
+            # Remove $ and commas, extract number
+            val_str = str(val).replace('$', '').replace(',', '')
+            matches = re.findall(r'\d+', val_str)
+            return int(matches[0]) if matches else 0
+        
+        df['sale_amount_numeric'] = df['sale_amount'].apply(extract_sale_amount)
+    else:
+        df['sale_amount_numeric'] = 0
+    
     print(f"✅ Cleaned data: {len(df)} records with {df['model'].nunique()} unique models")
+    print(f"   Average views: {df['views_numeric'].mean():.0f}")
+    print(f"   Average bids: {df['bids_numeric'].mean():.1f}")
+    
     return df
 
 def calculate_mii_scores(df):
@@ -185,20 +248,29 @@ def calculate_mii_scores(df):
     df['instagram_mentions'] = df['instagram_mentions'].fillna(8000)
     
     # Group by model and quarter
-    grouped = df.groupby(['model', 'quarter']).agg({
+    agg_dict = {
         'views_numeric': 'mean',
-        'bids_numeric': 'mean', 
+        'bids_numeric': 'mean',
+        'comments_numeric': 'mean',
+        'sale_amount_numeric': 'mean',
         'data_source': 'count',  # This becomes total_auctions
         'year': 'first',
         'car_age': 'first',
         'instagram_mentions': 'first'
-    }).reset_index()
+    }
+    
+    # Add make if it exists
+    if 'make' in df.columns:
+        agg_dict['make'] = 'first'
+    
+    grouped = df.groupby(['model', 'quarter']).agg(agg_dict).reset_index()
     
     grouped = grouped.rename(columns={'data_source': 'total_auctions'})
     
     # Calculate z-scores within each quarter
     def calculate_quarter_scores(group):
-        metrics = ['views_numeric', 'bids_numeric', 'total_auctions', 'instagram_mentions', 'car_age']
+        metrics = ['views_numeric', 'bids_numeric', 'comments_numeric', 
+                  'sale_amount_numeric', 'total_auctions', 'instagram_mentions', 'car_age']
         
         for metric in metrics:
             if metric in group.columns and group[metric].std() > 0:
@@ -210,19 +282,21 @@ def calculate_mii_scores(df):
     
     grouped = grouped.groupby('quarter').apply(calculate_quarter_scores).reset_index(drop=True)
     
-    # Calculate MII with simplified weighting
+    # Calculate MII with weighted scoring
     mii_weights = {
-        'z_views_numeric': 3.0,      # Viewer interest
-        'z_bids_numeric': 4.0,       # Market competition
-        'z_total_auctions': 2.0,     # Market activity
-        'z_instagram_mentions': 2.0, # Social presence
-        'z_car_age': 1.0            # Classic appeal
+        'z_views_numeric': 3.0,          # Viewer interest
+        'z_bids_numeric': 4.0,           # Market competition  
+        'z_sale_amount_numeric': 3.5,    # Market value
+        'z_comments_numeric': 1.5,       # Community engagement
+        'z_total_auctions': 2.0,         # Market activity
+        'z_instagram_mentions': 2.0,     # Social presence
+        'z_car_age': 1.0                # Classic appeal
     }
     
     total_weight = sum(mii_weights.values())
     
     grouped['MII_Score'] = sum(
-        grouped[col] * weight for col, weight in mii_weights.items()
+        grouped.get(col, 0) * weight for col, weight in mii_weights.items()
     ) / total_weight
     
     # Calculate MII Index (0-100 scale per quarter)
@@ -241,6 +315,10 @@ def calculate_mii_scores(df):
     # Add ranking
     grouped['Quarter_Rank'] = grouped.groupby('quarter')['MII_Index'].rank(ascending=False, method='min')
     
+    # Calculate momentum (quarter-over-quarter change)
+    grouped = grouped.sort_values(['model', 'quarter'])
+    grouped['MII_Momentum'] = grouped.groupby('model')['MII_Index'].diff()
+    
     # Add metadata
     grouped['calculation_date'] = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     grouped['components_used'] = ', '.join(mii_weights.keys())
@@ -251,11 +329,58 @@ def calculate_mii_scores(df):
     print(f"✅ Calculated MII for {len(grouped)} model-quarter combinations")
     return grouped
 
+def generate_insights(mii_results):
+    """Generate insights from MII results"""
+    print("\n📊 GENERATING INSIGHTS")
+    print("="*60)
+    
+    latest_quarter = mii_results['quarter'].iloc[0] if len(mii_results) > 0 else 'Unknown'
+    latest_data = mii_results[mii_results['quarter'] == latest_quarter]
+    
+    # Top performers
+    print(f"\n🏆 TOP 10 MODELS ({latest_quarter})")
+    print("-" * 75)
+    print(f"{'Rank':<5} {'Model':<35} {'MII':<8} {'Views':<10} {'Bids':<8} {'Year':<6}")
+    print("-" * 75)
+    
+    for _, row in latest_data.head(10).iterrows():
+        model_short = row['model'][:33] + '..' if len(row['model']) > 35 else row['model']
+        year_display = str(int(row['year'])) if pd.notna(row['year']) else 'N/A'
+        views_display = f"{row['views_numeric']:.0f}" if pd.notna(row['views_numeric']) else 'N/A'
+        bids_display = f"{row['bids_numeric']:.0f}" if pd.notna(row['bids_numeric']) else 'N/A'
+        
+        print(f"{int(row['Quarter_Rank']):<5} {model_short:<35} {row['MII_Index']:<8.1f} "
+              f"{views_display:<10} {bids_display:<8} {year_display:<6}")
+    
+    # Biggest movers (if we have multiple quarters)
+    if len(mii_results['quarter'].unique()) > 1:
+        movers = mii_results[mii_results['quarter'] == latest_quarter].nlargest(5, 'MII_Momentum')
+        if not movers.empty and movers['MII_Momentum'].notna().any():
+            print(f"\n📈 TOP GAINERS ({latest_quarter})")
+            print("-" * 60)
+            for _, row in movers.iterrows():
+                if pd.notna(row['MII_Momentum']):
+                    print(f"{row['model'][:40]:<40} +{row['MII_Momentum']:.1f} points")
+    
+    # Category insights
+    if 'make' in mii_results.columns:
+        make_stats = latest_data.groupby('make').agg({
+            'MII_Index': 'mean',
+            'model': 'count'
+        }).nlargest(5, 'MII_Index')
+        
+        print(f"\n🚗 TOP MAKES BY AVERAGE MII")
+        print("-" * 40)
+        for make, stats in make_stats.iterrows():
+            print(f"{make:<20} {stats['MII_Index']:.1f} ({int(stats['model'])} models)")
+    
+    return latest_quarter
+
 def main():
-    print("🚀 MII Calculator - GitHub Actions Compatible Version")
+    print("🚀 MII Calculator - Single File Version")
     print(f"⏰ Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # Load scraped data
+    # Load scraped data from S3
     raw_data = load_scraped_data()
     if raw_data.empty:
         print("❌ No data to process!")
@@ -270,36 +395,36 @@ def main():
     # Calculate MII scores
     mii_results = calculate_mii_scores(clean_data)
     
+    # Generate insights
+    latest_quarter = generate_insights(mii_results)
+    
     # Save results
     output_file = f"mii_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}.csv"
     mii_results.to_csv(output_file, index=False)
-    print(f"💾 Saved results to: {output_file}")
-    
-    # Show summary
-    latest_quarter = mii_results['quarter'].iloc[0] if len(mii_results) > 0 else 'Unknown'
-    latest_data = mii_results[mii_results['quarter'] == latest_quarter].head(10)
-    
-    print(f"\n📊 RESULTS SUMMARY")
-    print(f"Total models analyzed: {mii_results['model'].nunique()}")
-    print(f"Total auctions processed: {mii_results['total_auctions'].sum()}")
-    print(f"Latest quarter: {latest_quarter}")
-    
-    print(f"\n🏆 TOP 10 MODELS ({latest_quarter})")
-    print("Rank | Model                           | MII Index | Auctions | Year")
-    print("-" * 75)
-    
-    for _, row in latest_data.iterrows():
-        model_short = row['model'][:30] + '...' if len(row['model']) > 30 else row['model']
-        year_display = str(int(row['year'])) if pd.notna(row['year']) else 'N/A'
-        print(f"{int(row['Quarter_Rank']):4d} | {model_short:30} | {row['MII_Index']:8.1f} | {row['total_auctions']:8.0f} | {year_display}")
+    print(f"\n💾 Saved results to: {output_file}")
     
     # Upload to S3
-    print(f"\n☁️ Uploading to S3...")
+    print(f"☁️ Uploading to S3...")
     success = upload_to_s3(output_file, "my-mii-reports")
+    
+    # Also save a "latest" version for easy access
+    if success:
+        mii_results.to_csv("mii_results_latest.csv", index=False)
+        upload_to_s3("mii_results_latest.csv", "my-mii-reports")
+    
+    # Summary statistics
+    print(f"\n📊 FINAL STATISTICS")
+    print(f"="*40)
+    print(f"Total models analyzed: {mii_results['model'].nunique()}")
+    print(f"Total auctions processed: {mii_results['total_auctions'].sum():.0f}")
+    print(f"Latest quarter: {latest_quarter}")
+    print(f"Average MII Index: {mii_results[mii_results['quarter'] == latest_quarter]['MII_Index'].mean():.1f}")
     
     # Cleanup
     try:
         os.remove(output_file)
+        if os.path.exists("mii_results_latest.csv"):
+            os.remove("mii_results_latest.csv")
     except:
         pass
     
