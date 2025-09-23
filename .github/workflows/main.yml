@@ -1,145 +1,180 @@
-name: Daily Car Scraping
+name: BAT and CNB Scraper Pipeline
 
 on:
   schedule:
-    - cron: '0 2 * * *'
-  workflow_dispatch:
+    # Run twice daily to catch all auctions
+    - cron: '0 6 * * *'   # 6 AM UTC (1 AM EST / 10 PM PST previous day)
+    - cron: '0 18 * * *'  # 6 PM UTC (1 PM EST / 10 AM PST)
+  workflow_dispatch:  # Allow manual trigger from GitHub UI
 
 jobs:
-  scrape:
+  scrape-and-analyze:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    timeout-minutes: 180  # 3 hours max for processing up to 500 auctions
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 1  # Shallow clone for faster checkout
     
-    - name: Set up Python
+    - name: Set up Python 3.10
       uses: actions/setup-python@v4
       with:
-        python-version: '3.11'
-    
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y \
-          libnss3-dev \
-          libatk-bridge2.0-dev \
-          libdrm-dev \
-          libxcomposite-dev \
-          libxdamage-dev \
-          libxrandr-dev \
-          libgbm-dev \
-          libxss-dev \
-          xvfb
+        python-version: '3.10'
+        cache: 'pip'  # Cache pip dependencies for faster installs
     
     - name: Install Python dependencies
       run: |
-        pip install --upgrade pip
+        python -m pip install --upgrade pip
         pip install -r requirements.txt
-    
-    - name: Install Playwright browsers (with fallback)
+        pip list  # Show installed packages for debugging
+        
+    - name: Install Playwright and browsers
       run: |
-        echo "Installing Playwright browsers..."
-        playwright install chromium || echo "Playwright install failed, trying alternative..."
-        
-        # Try installing with system dependencies
-        sudo apt-get install -y chromium-browser || echo "System chromium install failed"
-        
-        # Verify installation
-        playwright --version || echo "Playwright CLI not available"
-        
-        echo "Browser installation completed (check logs for any issues)"
+        playwright install chromium
+        playwright install-deps chromium
+        echo "Playwright version:"
+        playwright --version
     
-    - name: Configure AWS
-      uses: aws-actions/configure-aws-credentials@v4
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: ${{ secrets.AWS_REGION }}
+        aws-region: us-east-1  # Change if your S3 bucket is in a different region
     
-    - name: Start virtual display
+    - name: Test AWS S3 connection
       run: |
-        export DISPLAY=:99
-        Xvfb :99 -screen 0 1024x768x24 > /dev/null 2>&1 &
-        sleep 3
-        echo "Virtual display started"
+        echo "Testing S3 connection to bucket: my-mii-reports"
+        aws s3 ls s3://my-mii-reports/ --max-items 5 || echo "S3 connection test failed"
     
-    - name: Run CNB Scraper
+    - name: Run BAT scraper (Main - Appends to bat.csv)
+      id: bat_scraper
       run: |
-        export DISPLAY=:99
-        echo "🚀 Starting CNB scraper..."
-        python cnb_scraper.py
-        echo "✅ CNB scraper completed successfully"
-      continue-on-error: true
-      
-    - name: Wait between scrapers
-      run: |
-        echo "⏳ Waiting 30 seconds between scrapers..."
-        sleep 30
-      
-    - name: Run BAT Scraper
-      run: |
-        export DISPLAY=:99
-        echo "🚀 Starting BAT scraper..."
+        echo "========================================="
+        echo "Starting BAT Scraper"
+        echo "========================================="
         python bat_scraper.py
-        echo "✅ BAT scraper completed successfully"
-      continue-on-error: true
+        echo "BAT scraper exit code: $?"
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+        PYTHONUNBUFFERED: "1"  # Ensure real-time output
+      continue-on-error: false  # Fail workflow if BAT scraper fails
     
-    - name: Run Mii Calculations
+    - name: Run CNB scraper (Secondary)
+      id: cnb_scraper
+      if: success()  # Only run if BAT scraper succeeded
       run: |
-        export DISPLAY=:99
-        echo "🧮 Starting Mii calculations..."
+        echo "========================================="
+        echo "Starting CNB Scraper"
+        echo "========================================="
+        python cnb_scraper.py
+        echo "CNB scraper exit code: $?"
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+        PYTHONUNBUFFERED: "1"
+      continue-on-error: true  # Don't fail workflow if CNB has issues
+    
+    - name: Run MII Calculator
+      id: mii_calculator
+      if: success() || steps.bat_scraper.outcome == 'success'  # Run if BAT succeeded
+      run: |
+        echo "========================================="
+        echo "Starting MII Calculator"
+        echo "========================================="
         python enhanced_mii_all_models.py
-        echo "✅ Mii calculations completed successfully"
-      continue-on-error: true
+        echo "MII calculator exit code: $?"
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_DEFAULT_REGION: us-east-1
+        PYTHONUNBUFFERED: "1"
+      continue-on-error: true  # Don't fail workflow if MII calc has issues
     
-    - name: Upload CSV files to S3
+    - name: Check for output files
+      if: always()  # Always run this step
       run: |
-        echo "☁️ Uploading all CSV files to S3..."
-        uploaded_count=0
-        
-        for file in *.csv; do
-          if [ -f "$file" ]; then
-            echo "📄 Uploading: $file"
-            if aws s3 cp "$file" s3://my-mii-reports/; then
-              echo "✅ Successfully uploaded: $file"
-              uploaded_count=$((uploaded_count + 1))
-            else
-              echo "❌ Failed to upload: $file"
-            fi
-          fi
-        done
-        
-        # Also upload JSON reports if they exist
-        for file in *.json; do
-          if [ -f "$file" ]; then
-            echo "📄 Uploading JSON: $file"
-            if aws s3 cp "$file" s3://my-mii-reports/; then
-              echo "✅ Successfully uploaded: $file"
-              uploaded_count=$((uploaded_count + 1))
-            else
-              echo "❌ Failed to upload: $file"
-            fi
-          fi
-        done
-        
-        if [ $uploaded_count -eq 0 ]; then
-          echo "⚠️ No files found to upload"
-        else
-          echo "🎉 Uploaded $uploaded_count file(s) to S3"
-        fi
-        
-        # List recent files in S3 bucket
-        echo "📂 Recent files in S3 bucket:"
-        aws s3 ls s3://my-mii-reports/ --recursive | sort -k1,2 | tail -15
+        echo "Checking for generated files..."
+        echo "CSV files:"
+        ls -la *.csv 2>/dev/null || echo "No CSV files found"
+        echo ""
+        echo "Log files:"
+        ls -la *.log 2>/dev/null || echo "No log files found"
+        echo ""
+        echo "All files in directory:"
+        ls -la
     
-    - name: Upload artifacts (for debugging)
-      uses: actions/upload-artifact@v4
-      if: always()
+    - name: Upload artifacts for debugging
+      if: always()  # Always save artifacts for debugging
+      uses: actions/upload-artifact@v3
       with:
-        name: scraping-results
+        name: scraper-outputs-${{ github.run_number }}
         path: |
           *.csv
           *.log
           *.json
+          debug_*
         retention-days: 7
+        if-no-files-found: warn
+    
+    - name: Generate summary
+      if: always()
+      run: |
+        echo "## Workflow Summary" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### Execution Status" >> $GITHUB_STEP_SUMMARY
+        echo "- BAT Scraper: ${{ steps.bat_scraper.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "- CNB Scraper: ${{ steps.cnb_scraper.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "- MII Calculator: ${{ steps.mii_calculator.outcome }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        echo "### Timestamp" >> $GITHUB_STEP_SUMMARY
+        echo "Run completed at: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+    
+    - name: Send Slack notification on failure (Optional)
+      if: failure()
+      run: |
+        echo "Workflow failed! You could add Slack/email notification here"
+        # Uncomment and configure if you want Slack notifications:
+        # curl -X POST -H 'Content-type: application/json' \
+        #   --data '{"text":"BAT Scraper workflow failed! Check GitHub Actions."}' \
+        #   ${{ secrets.SLACK_WEBHOOK_URL }}
+    
+    - name: Clean up temp files
+      if: always()
+      run: |
+        echo "Cleaning up temporary files..."
+        rm -f temp_*.csv
+        rm -f previous_*.csv
+        echo "Cleanup complete"
+
+  # Optional: Separate job for monitoring S3 data integrity
+  verify-data:
+    runs-on: ubuntu-latest
+    needs: scrape-and-analyze
+    if: success()
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+    
+    - name: Verify bat.csv in S3
+      run: |
+        echo "Verifying bat.csv in S3..."
+        aws s3 ls s3://my-mii-reports/bat.csv
+        
+        # Get file size and last modified
+        aws s3api head-object --bucket my-mii-reports --key bat.csv \
+          --query '[ContentLength, LastModified]' --output text
+        
+        echo "Data verification complete"
