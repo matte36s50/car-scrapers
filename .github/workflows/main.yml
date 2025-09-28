@@ -32,8 +32,9 @@ jobs:
         
     - name: Install Playwright and browsers
       run: |
+        pip install playwright
+        sudo playwright install-deps chromium
         playwright install chromium
-        playwright install-deps chromium
         echo "Playwright version:"
         playwright --version
     
