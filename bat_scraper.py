@@ -8,6 +8,14 @@ from playwright.sync_api import sync_playwright
 import boto3
 from botocore.exceptions import NoCredentialsError
 
+print("=" * 60)
+print("🚀 BAT SCRAPER STARTING")
+print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 60)
+
+print("\n[1/8] Importing libraries...")
+print("✓ All imports successful")
+
 # === S3 UPLOAD CODE ===
 def upload_to_s3(file_name, bucket, object_name=None):
     s3 = boto3.client('s3')
@@ -26,6 +34,7 @@ def upload_to_s3(file_name, bucket, object_name=None):
 
 def download_existing_bat_csv():
     """Download existing bat.csv from S3 to append to it"""
+    print("\n[2/8] Downloading existing data from S3...")
     s3 = boto3.client('s3')
     try:
         s3.download_file('my-mii-reports', 'bat.csv', 'existing_bat.csv')
@@ -127,8 +136,14 @@ SELECTORS = {
 
 def collect_auction_urls(page):
     """Collect auction URLs from results page"""
+    print(f"\n[4/8] Navigating to results page: {RESULTS_URL}")
     page.goto(RESULTS_URL, timeout=60_000)
+    print("✓ Page loaded successfully")
+    
+    print(f"Waiting for auction tiles selector: {SELECTORS['tile']}")
     page.wait_for_selector(SELECTORS["tile"])
+    print("✓ Auction tiles found")
+    
     urls, loaded = [], 0
     consecutive_failures = 0
     max_failures = 3
@@ -190,7 +205,7 @@ def collect_auction_urls(page):
                 print("No additional listings found - stopping collection")
                 break
 
-    print(f"Collection complete: found {len(urls)} auction URLs")
+    print(f"✓ Collection complete: found {len(urls)} auction URLs")
     return urls
 
 def parse_auction(page, url):
@@ -259,7 +274,7 @@ def parse_auction(page, url):
 
 def run_scraper():
     """Main scraper function"""
-    print(f"🚀 Starting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\n🚀 Starting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
@@ -267,19 +282,30 @@ def run_scraper():
     new_data = []
     years_extracted = []
     
+    print("\n[3/8] Initializing Playwright browser...")
     with sync_playwright() as pw:
+        print("✓ Playwright context created")
+        
+        print("Launching Chromium browser (headless mode)...")
         browser = pw.chromium.launch(headless=True)
+        print("✓ Browser launched successfully")
+        
+        print("Creating new page...")
         page = browser.new_page()
+        print("✓ Page created successfully")
 
         try:
+            print("\n[5/8] Collecting auction URLs...")
             urls = collect_auction_urls(page)
-            print(f"Scraping details for {len(urls)} auctions...")
             
+            print(f"\n[6/8] Filtering URLs...")
             # Filter out URLs we've already scraped
             urls_to_scrape = [url for url in urls if url not in existing_urls]
-            print(f"Filtering out {len(urls) - len(urls_to_scrape)} already scraped auctions")
-            print(f"Will scrape {len(urls_to_scrape)} new auctions")
+            print(f"Total URLs collected: {len(urls)}")
+            print(f"Already scraped: {len(urls) - len(urls_to_scrape)}")
+            print(f"New URLs to scrape: {len(urls_to_scrape)}")
 
+            print(f"\n[7/8] Scraping individual auction pages...")
             for i, url in enumerate(urls_to_scrape, 1):
                 try:
                     print(f"\n[{i}/{len(urls_to_scrape)}] Processing: {url}")
@@ -297,41 +323,47 @@ def run_scraper():
                     print(f"  ✗ Error on {url}: {e}")
 
         except Exception as e:
-            print(f"Error during URL collection: {e}")
+            print(f"❌ Error during URL collection: {e}")
             print("Proceeding with any URLs that were collected...")
         
         finally:
+            print("\nClosing browser...")
             browser.close()
+            print("✓ Browser closed")
 
     if not new_data:
-        print("No new data collected.")
+        print("\n⚠️ No new data collected.")
         return
 
+    print(f"\n[8/8] Processing and saving data...")
     # Create DataFrame from new data
     new_df = pd.DataFrame(new_data)
+    print(f"✓ Created DataFrame with {len(new_df)} new rows")
     
     # Combine with existing data
     if not existing_df.empty:
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
         # Remove duplicates based on auction_url
         combined_df = combined_df.drop_duplicates(subset=['auction_url'], keep='last')
-        print(f"📊 Combined data: {len(combined_df)} total rows")
+        print(f"✓ Combined data: {len(combined_df)} total rows")
     else:
         combined_df = new_df
-        print(f"📊 New dataset: {len(combined_df)} rows")
+        print(f"✓ New dataset: {len(combined_df)} rows")
     
     # Save to CSV
     combined_df.to_csv("bat.csv", index=False)
     print(f"✅ Saved to bat.csv")
 
     # Show summary
-    print(f"\n=== SUMMARY ===")
+    print(f"\n" + "=" * 60)
+    print("=== SUMMARY ===")
     print(f"Total auctions in file: {len(combined_df)}")
     print(f"New auctions added: {len(new_data)}")
     if years_extracted:
         print(f"Years successfully extracted: {len(years_extracted)}/{len(new_data)}")
         success_rate = len(years_extracted) / len(new_data) * 100
         print(f"Year extraction success rate: {success_rate:.1f}%")
+    print("=" * 60)
 
     # Upload to S3
     print("\n📤 Uploading bat.csv to S3...")
@@ -343,6 +375,12 @@ def run_scraper():
     # Clean up
     if os.path.exists('existing_bat.csv'):
         os.remove('existing_bat.csv')
+        print("✓ Cleaned up temporary files")
+
+    print("\n" + "=" * 60)
+    print("🎉 BAT SCRAPER COMPLETED SUCCESSFULLY")
+    print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
 
 if __name__ == "__main__":
     run_scraper()
