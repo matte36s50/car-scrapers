@@ -1,11 +1,9 @@
 name: BAT and CNB Scraper Pipeline
-
 on:
   schedule:
     - cron: '0 6 * * *'   # 6 AM UTC daily
     - cron: '0 18 * * *'  # 6 PM UTC daily
   workflow_dispatch:      # Allow manual trigger
-
 jobs:
   scrape-and-analyze:
     runs-on: ubuntu-22.04
@@ -52,6 +50,7 @@ jobs:
         aws s3 ls s3://my-mii-reports/ --max-items 5 || echo "S3 connection test completed"
     
     - name: Run BAT scraper
+      timeout-minutes: 15
       run: |
         echo "Starting BAT scraper..."
         python bat_scraper.py
@@ -62,6 +61,7 @@ jobs:
     
     - name: Run CNB scraper
       if: success()
+      timeout-minutes: 15
       run: |
         echo "Starting CNB scraper..."
         python cnb_scraper.py || echo "CNB scraper completed with issues"
@@ -73,6 +73,7 @@ jobs:
     
     - name: Run MII calculator
       if: success()
+      timeout-minutes: 10
       run: |
         echo "Starting MII calculator..."
         python enhanced_mii_all_models.py || echo "MII calculator completed"
