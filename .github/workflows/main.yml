@@ -50,7 +50,7 @@ jobs:
         aws s3 ls s3://my-mii-reports/ --max-items 5 || echo "S3 connection test completed"
     
     - name: Run BAT scraper
-      timeout-minutes: 15
+      timeout-minutes: 60
       run: |
         echo "Starting BAT scraper..."
         python -c "print('Python is working')"
