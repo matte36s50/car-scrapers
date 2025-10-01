@@ -42,7 +42,7 @@ jobs:
       with:
         aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        aws-region: us-east-1
+        aws-region: us-east-2
     
     - name: Test S3 connection
       run: |
@@ -53,11 +53,16 @@ jobs:
       timeout-minutes: 15
       run: |
         echo "Starting BAT scraper..."
-        python bat_scraper.py
+        python -c "print('Python is working')"
+        python -c "import pandas; print('Pandas OK')"
+        python -c "import boto3; print('Boto3 OK')"
+        python -c "from playwright.sync_api import sync_playwright; print('Playwright sync_api OK')"
+        echo "All imports verified, running scraper..."
+        python -u bat_scraper.py
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_DEFAULT_REGION: us-east-1
+        AWS_DEFAULT_REGION: us-east-2
     
     - name: Run CNB scraper
       if: success()
@@ -69,7 +74,7 @@ jobs:
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_DEFAULT_REGION: us-east-1
+        AWS_DEFAULT_REGION: us-east-2
     
     - name: Run MII calculator
       if: success()
@@ -81,7 +86,7 @@ jobs:
       env:
         AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
         AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-        AWS_DEFAULT_REGION: us-east-1
+        AWS_DEFAULT_REGION: us-east-2
     
     - name: Upload artifacts
       if: always()
