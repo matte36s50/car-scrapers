@@ -8,7 +8,7 @@ import datetime
 import requests
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
-from botocore.exceptions import NoCredentialsError
+from botocore.exceptions import NoCredentialsError, ClientError
 import traceback
 
 # === S3 CONFIGURATION ===
@@ -22,31 +22,45 @@ def download_existing_cnb_csv():
     
     try:
         s3.download_file(S3_BUCKET, CNB_CSV_FILENAME, TEMP_LOCAL_FILE)
-        print(f"✅ Downloaded existing cnb.csv from S3")
+        print(f"Downloaded existing cnb.csv from S3")
         
         # Load and analyze existing data
         df = pd.read_csv(TEMP_LOCAL_FILE)
-        print(f"📊 Existing data: {len(df)} rows, {len(df.columns)} columns")
+        print(f"Existing data: {len(df)} rows, {len(df.columns)} columns")
         
         # Get set of existing URLs for duplicate checking
         existing_urls = set(df['auction_url'].dropna().values)
-        print(f"📋 Found {len(existing_urls)} existing auction URLs")
+        print(f"Found {len(existing_urls)} existing auction URLs")
         
         return df, existing_urls
         
-    except s3.exceptions.NoSuchKey:
-        print(f"⚠️ No existing cnb.csv found in S3, will create new one")
-        # Return empty dataframe with expected columns
-        columns = [
-            "model", "make", "vin", "engine", "drivetrain", "transmission", "body_style",
-            "exterior_color", "interior_color", "title_status", "location", "mileage",
-            "sale_amount", "sale_date", "sale_type", "bids", "views", "comments",
-            "seller", "auction_url", "year", "scraped_date"
-        ]
-        return pd.DataFrame(columns=columns), set()
+    except ClientError as e:
+        # Handle 404 - file doesn't exist yet
+        if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
+            print(f"No existing cnb.csv found in S3, will create new one")
+            columns = [
+                "model", "make", "vin", "engine", "drivetrain", "transmission", "body_style",
+                "exterior_color", "interior_color", "title_status", "location", "mileage",
+                "sale_amount", "sale_date", "sale_type", "bids", "views", "comments",
+                "seller", "auction_url", "year", "scraped_date"
+            ]
+            return pd.DataFrame(columns=columns), set()
+        else:
+            raise
     except Exception as e:
-        print(f"❌ Error downloading cnb.csv: {e}")
-        raise
+        # Catch any other error that might indicate file not found
+        if "404" in str(e) or "Not Found" in str(e) or "NoSuchKey" in str(e):
+            print(f"No existing cnb.csv found in S3 (starting fresh)")
+            columns = [
+                "model", "make", "vin", "engine", "drivetrain", "transmission", "body_style",
+                "exterior_color", "interior_color", "title_status", "location", "mileage",
+                "sale_amount", "sale_date", "sale_type", "bids", "views", "comments",
+                "seller", "auction_url", "year", "scraped_date"
+            ]
+            return pd.DataFrame(columns=columns), set()
+        else:
+            print(f"Error downloading cnb.csv: {e}")
+            raise
 
 def upload_updated_cnb_csv(df):
     """Upload updated cnb.csv back to S3"""
@@ -63,20 +77,20 @@ def upload_updated_cnb_csv(df):
                 CopySource={'Bucket': S3_BUCKET, 'Key': CNB_CSV_FILENAME},
                 Key=f"backups/{CNB_CSV_FILENAME}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
             )
-            print(f"📦 Created backup of existing cnb.csv")
+            print(f"Created backup of existing cnb.csv")
         except:
             pass  # No existing file to backup
         
         # Upload updated file
         s3.upload_file(TEMP_LOCAL_FILE, S3_BUCKET, CNB_CSV_FILENAME)
-        print(f"✅ Successfully uploaded updated cnb.csv to S3 ({len(df)} total rows)")
+        print(f"Successfully uploaded updated cnb.csv to S3 ({len(df)} total rows)")
         
         # Clean up temp file
         os.remove(TEMP_LOCAL_FILE)
         return True
         
     except Exception as e:
-        print(f"❌ Upload failed: {e}")
+        print(f"Upload failed: {e}")
         return False
 
 SITEMAP_URL = "https://carsandbids.com/cab-sitemap/auctions.xml"
@@ -85,7 +99,7 @@ MAX_AUCTIONS_PER_RUN = 300  # CNB has fewer daily auctions than BAT
 
 def get_sitemap_urls():
     """Get CNB sitemap URLs"""
-    print("🌐 Fetching CNB sitemap...")
+    print("Fetching CNB sitemap...")
     
     try:
         headers = {
@@ -95,13 +109,13 @@ def get_sitemap_urls():
         
         if response.status_code == 200:
             xml_string = response.text
-            print("✅ Got CNB sitemap")
+            print("Got CNB sitemap")
         else:
             raise Exception(f"HTTP {response.status_code}")
             
     except Exception as e:
-        print(f"📡 Direct request failed: {e}")
-        print("🌐 Trying browser method...")
+        print(f"Direct request failed: {e}")
+        print("Trying browser method...")
         
         try:
             with sync_playwright() as p:
@@ -113,22 +127,22 @@ def get_sitemap_urls():
                 
                 for attempt in range(3):
                     try:
-                        print(f"🔄 Browser attempt {attempt + 1}/3...")
+                        print(f"Browser attempt {attempt + 1}/3...")
                         page.goto(SITEMAP_URL, timeout=45_000, wait_until="networkidle")
                         time.sleep(5)
                         xml_string = page.content()
-                        print("✅ Got CNB sitemap via browser")
+                        print("Got CNB sitemap via browser")
                         break
                     except Exception as attempt_error:
                         if attempt == 2:
                             raise attempt_error
-                        print(f"⚠️ Attempt {attempt + 1} failed, retrying...")
+                        print(f"Attempt {attempt + 1} failed, retrying...")
                         time.sleep(10)
                 
                 browser.close()
                 
         except Exception as browser_error:
-            print(f"❌ Both methods failed: {browser_error}")
+            print(f"Both methods failed: {browser_error}")
             return []
 
     # Extract XML content from browser wrapper if needed
@@ -147,11 +161,11 @@ def get_sitemap_urls():
             soup = BeautifulSoup(xml_string, "html.parser")
             urls = [loc.text for loc in soup.find_all("loc") if "/auctions/" in loc.text]
         
-        print(f"🔍 Found {len(urls)} total CNB auction URLs")
+        print(f"Found {len(urls)} total CNB auction URLs")
         return urls
         
     except Exception as e:
-        print(f"❌ Error parsing XML: {e}")
+        print(f"Error parsing XML: {e}")
         return []
 
 def extract_year_from_url(url):
@@ -344,7 +358,7 @@ def extract_all_auction_data(page, auction_url):
                     except:
                         continue
         except Exception as e:
-            print(f"    ⚠️ Facts extraction error: {e}")
+            print(f"    Facts extraction error: {e}")
         
         # Extract make from model if not found
         if not data["make"] and data["model"]:
@@ -358,18 +372,18 @@ def extract_all_auction_data(page, auction_url):
                         data["make"] = word
                         break
         
-        print(f"    ✅ Extracted: {data['model'][:40] if data['model'] else 'Unknown'}... | "
+        print(f"    Extracted: {data['model'][:40] if data['model'] else 'Unknown'}... | "
               f"${data['sale_amount']} | {data['views']} views | {data['bids']} bids")
         
         return data
         
     except Exception as e:
-        print(f"    ❌ Extraction error: {str(e)[:100]}")
+        print(f"    Extraction error: {str(e)[:100]}")
         traceback.print_exc()
         return data
 
 def main():
-    print(f"🚀 Starting CNB Scraper (Append Mode) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Starting CNB Scraper (Append Mode) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # 1. Download existing cnb.csv from S3
     existing_df, existing_urls = download_existing_cnb_csv()
@@ -378,20 +392,20 @@ def main():
     all_urls = get_sitemap_urls()
     
     if not all_urls:
-        print("❌ Failed to get sitemap URLs!")
+        print("Failed to get sitemap URLs!")
         return False
     
     # 3. Filter for new URLs only
     new_urls = [url for url in all_urls if url not in existing_urls]
-    print(f"✨ Found {len(new_urls)} new auctions to scrape")
+    print(f"Found {len(new_urls)} new auctions to scrape")
     
     if not new_urls:
-        print("✅ No new auctions found - cnb.csv is up to date!")
+        print("No new auctions found - cnb.csv is up to date!")
         return True
     
     # 4. Limit to MAX_AUCTIONS_PER_RUN
     new_urls = new_urls[:MAX_AUCTIONS_PER_RUN]
-    print(f"🎯 Processing {len(new_urls)} new auctions (max {MAX_AUCTIONS_PER_RUN} per run)")
+    print(f"Processing {len(new_urls)} new auctions (max {MAX_AUCTIONS_PER_RUN} per run)")
     
     # 5. Scrape new auctions
     new_rows = []
@@ -429,7 +443,7 @@ def main():
                     except Exception as nav_error:
                         if retry == 2:
                             raise nav_error
-                        print(f"  🔄 Retry {retry + 1}")
+                        print(f"  Retry {retry + 1}")
                         time.sleep(5)
                 
                 # Extract comprehensive data
@@ -437,7 +451,7 @@ def main():
                 
                 # Skip if auction is still in progress (no sale date)
                 if not data['sale_date'] or data['sale_date'].strip() == "":
-                    print(f"  ⏳ Skipping - auction still in progress")
+                    print(f"  Skipping - auction still in progress")
                     skipped_in_progress += 1
                     continue
                 
@@ -446,11 +460,11 @@ def main():
                     new_rows.append(data)
                     successful += 1
                 else:
-                    print(f"  ⚠️ Insufficient data extracted")
+                    print(f"  Insufficient data extracted")
                     failed += 1
                     
             except Exception as e:
-                print(f"  ❌ Error: {str(e)[:150]}")
+                print(f"  Error: {str(e)[:150]}")
                 failed += 1
                 
             finally:
@@ -460,20 +474,20 @@ def main():
                 
                 # Save progress every 50 auctions
                 if len(new_rows) > 0 and len(new_rows) % 50 == 0:
-                    print(f"\n💾 Saving progress ({len(new_rows)} new rows)...")
+                    print(f"\nSaving progress ({len(new_rows)} new rows)...")
                     temp_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
                     upload_updated_cnb_csv(temp_df)
         
         browser.close()
         
-        print(f"\n📊 Scraping complete:")
-        print(f"   ✅ Successful: {successful}")
-        print(f"   ⏳ In-progress skipped: {skipped_in_progress}")
-        print(f"   ❌ Failed: {failed}")
+        print(f"\nScraping complete:")
+        print(f"   Successful: {successful}")
+        print(f"   In-progress skipped: {skipped_in_progress}")
+        print(f"   Failed: {failed}")
     
     # 6. Append new data to existing dataframe
     if new_rows:
-        print(f"\n📝 Adding {len(new_rows)} new rows to cnb.csv")
+        print(f"\nAdding {len(new_rows)} new rows to cnb.csv")
         new_df = pd.DataFrame(new_rows)
         
         # Combine with existing data
@@ -484,12 +498,12 @@ def main():
         updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep='first')
         after_dedup = len(updated_df)
         if before_dedup != after_dedup:
-            print(f"🧹 Removed {before_dedup - after_dedup} duplicate rows")
+            print(f"Removed {before_dedup - after_dedup} duplicate rows")
         
         # Sort by year (newest first) for better organization
         updated_df = updated_df.sort_values('year', ascending=False, na_position='last')
         
-        print(f"📊 Updated cnb.csv stats:")
+        print(f"Updated cnb.csv stats:")
         print(f"   Total rows: {len(updated_df)}")
         print(f"   Total unique auctions: {updated_df['auction_url'].nunique()}")
         if pd.notna(updated_df['year']).any():
@@ -497,13 +511,13 @@ def main():
         
         # 7. Upload updated file back to S3
         if upload_updated_cnb_csv(updated_df):
-            print(f"🎉 Successfully updated cnb.csv in S3!")
+            print(f"Successfully updated cnb.csv in S3!")
             return True
         else:
-            print(f"❌ Failed to upload updated cnb.csv")
+            print(f"Failed to upload updated cnb.csv")
             return False
     else:
-        print(f"⚠️ No new completed auctions to add")
+        print(f"No new completed auctions to add")
         return True
 
 if __name__ == "__main__":
@@ -511,6 +525,6 @@ if __name__ == "__main__":
         success = main()
         exit(0 if success else 1)
     except Exception as e:
-        print(f"❌ Fatal error: {e}")
+        print(f"Fatal error: {e}")
         traceback.print_exc()
         exit(1)
