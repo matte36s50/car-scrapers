@@ -13,7 +13,7 @@ import traceback
 
 # === S3 CONFIGURATION ===
 S3_BUCKET = "my-mii-reports"
-CNB_CSV_FILENAME = "cnb.csv"  # Single file to maintain
+CNB_CSV_FILENAME = "cnb.csv"
 TEMP_LOCAL_FILE = "temp_cnb.csv"
 
 def download_existing_cnb_csv():
@@ -24,18 +24,15 @@ def download_existing_cnb_csv():
         s3.download_file(S3_BUCKET, CNB_CSV_FILENAME, TEMP_LOCAL_FILE)
         print(f"Downloaded existing cnb.csv from S3")
         
-        # Load and analyze existing data
         df = pd.read_csv(TEMP_LOCAL_FILE)
         print(f"Existing data: {len(df)} rows, {len(df.columns)} columns")
         
-        # Get set of existing URLs for duplicate checking
         existing_urls = set(df['auction_url'].dropna().values)
         print(f"Found {len(existing_urls)} existing auction URLs")
         
         return df, existing_urls
         
     except ClientError as e:
-        # Handle 404 - file doesn't exist yet
         if e.response['Error']['Code'] == '404' or e.response['Error']['Code'] == 'NoSuchKey':
             print(f"No existing cnb.csv found in S3, will create new one")
             columns = [
@@ -48,7 +45,6 @@ def download_existing_cnb_csv():
         else:
             raise
     except Exception as e:
-        # Catch any other error that might indicate file not found
         if "404" in str(e) or "Not Found" in str(e) or "NoSuchKey" in str(e):
             print(f"No existing cnb.csv found in S3 (starting fresh)")
             columns = [
@@ -67,10 +63,8 @@ def upload_updated_cnb_csv(df):
     s3 = boto3.client('s3')
     
     try:
-        # Save dataframe to CSV
         df.to_csv(TEMP_LOCAL_FILE, index=False)
         
-        # Create backup first
         try:
             s3.copy_object(
                 Bucket=S3_BUCKET,
@@ -79,13 +73,11 @@ def upload_updated_cnb_csv(df):
             )
             print(f"Created backup of existing cnb.csv")
         except:
-            pass  # No existing file to backup
+            pass
         
-        # Upload updated file
         s3.upload_file(TEMP_LOCAL_FILE, S3_BUCKET, CNB_CSV_FILENAME)
         print(f"Successfully uploaded updated cnb.csv to S3 ({len(df)} total rows)")
         
-        # Clean up temp file
         os.remove(TEMP_LOCAL_FILE)
         return True
         
@@ -95,7 +87,7 @@ def upload_updated_cnb_csv(df):
 
 SITEMAP_URL = "https://carsandbids.com/cab-sitemap/auctions.xml"
 SLEEP_BETWEEN_AUCTIONS = 3.0
-MAX_AUCTIONS_PER_RUN = 300  # CNB has fewer daily auctions than BAT
+MAX_AUCTIONS_PER_RUN = 300
 
 def get_sitemap_urls():
     """Get CNB sitemap URLs"""
@@ -128,8 +120,13 @@ def get_sitemap_urls():
                 for attempt in range(3):
                     try:
                         print(f"Browser attempt {attempt + 1}/3...")
-                        page.goto(SITEMAP_URL, timeout=45_000, wait_until="networkidle")
+                        page.goto(SITEMAP_URL, timeout=45_000)
+                        
+                        print("Waiting for XML content to load...")
+                        page.wait_for_selector("urlset", timeout=30_000)
+                        
                         time.sleep(5)
+                        
                         xml_string = page.content()
                         print("Got CNB sitemap via browser")
                         break
@@ -145,27 +142,31 @@ def get_sitemap_urls():
             print(f"Both methods failed: {browser_error}")
             return []
 
-    # Extract XML content from browser wrapper if needed
-    if "<pre id=\"webkit-xml-viewer-source-xml\"" in xml_string:
+    if "<pre" in xml_string or "webkit-xml-viewer" in xml_string:
         soup_html = BeautifulSoup(xml_string, "html.parser")
-        pre = soup_html.find("pre", id="webkit-xml-viewer-source-xml")
+        pre = soup_html.find("pre")
         if pre:
             xml_string = pre.text
+            print("Extracted XML from pre tag")
 
-    # Parse URLs
     try:
         soup = BeautifulSoup(xml_string, "xml")
-        urls = [loc.text for loc in soup.find_all("loc") if "/auctions/" in loc.text]
+        locs = soup.find_all("loc")
         
-        if not urls:
+        if not locs:
+            print("No locs found with XML parser, trying HTML parser...")
             soup = BeautifulSoup(xml_string, "html.parser")
-            urls = [loc.text for loc in soup.find_all("loc") if "/auctions/" in loc.text]
+            locs = soup.find_all("loc")
+        
+        urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
         
         print(f"Found {len(urls)} total CNB auction URLs")
         return urls
         
     except Exception as e:
         print(f"Error parsing XML: {e}")
+        print("First 500 chars of content:")
+        print(xml_string[:500])
         return []
 
 def extract_year_from_url(url):
@@ -224,11 +225,9 @@ def extract_all_auction_data(page, auction_url):
     }
     
     try:
-        # Wait for page to load
         page.wait_for_selector("body", timeout=15000)
         time.sleep(2)
         
-        # Get title/model
         try:
             title_element = page.query_selector("h1")
             if title_element:
@@ -236,14 +235,12 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract year from URL or title
         data["year"] = extract_year_from_url(auction_url)
         if not data["year"] and data["model"]:
             year_match = re.search(r'\b(19|20)\d{2}\b', data["model"])
             if year_match:
                 data["year"] = int(year_match.group(0))
         
-        # Extract sale amount
         try:
             bid_selectors = [
                 "span.bid-value",
@@ -261,13 +258,11 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract sale date and type
         try:
             date_element = page.query_selector("span.time-ended") or page.query_selector(".auction-end-time")
             if date_element:
                 data["sale_date"] = date_element.inner_text().strip()
             
-            # Determine sale type
             sale_type_element = page.query_selector("span.value")
             if sale_type_element:
                 sale_text = sale_type_element.inner_text().lower()
@@ -280,7 +275,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract bids
         try:
             bids_element = page.query_selector("li.num-bids")
             if bids_element:
@@ -291,7 +285,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract views
         try:
             views_element = page.query_selector("li span.views")
             if views_element:
@@ -299,7 +292,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract comments count
         try:
             comments_element = page.query_selector(".comments-count") or page.query_selector(".comment-count")
             if comments_element:
@@ -310,7 +302,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract seller
         try:
             seller_element = page.query_selector("li.seller")
             if seller_element:
@@ -318,7 +309,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract vehicle details from facts section
         try:
             fact_containers = page.query_selector_all("dl")
             for container in fact_containers:
@@ -330,7 +320,6 @@ def extract_all_auction_data(page, auction_url):
                         if dd and dd.as_element():
                             value = clean_text(dd.as_element().inner_text())
                             if value and key:
-                                # Map keys to our data fields
                                 if key == "make":
                                     data["make"] = value
                                 elif key == "model":
@@ -360,11 +349,9 @@ def extract_all_auction_data(page, auction_url):
         except Exception as e:
             print(f"    Facts extraction error: {e}")
         
-        # Extract make from model if not found
         if not data["make"] and data["model"]:
             model_words = data["model"].split()
             if len(model_words) > 0:
-                # Common car makes
                 common_makes = ['Toyota', 'Honda', 'Ford', 'Chevrolet', 'BMW', 'Mercedes', 
                                'Audi', 'Volkswagen', 'Nissan', 'Mazda', 'Porsche', 'Ferrari']
                 for word in model_words:
@@ -385,17 +372,14 @@ def extract_all_auction_data(page, auction_url):
 def main():
     print(f"Starting CNB Scraper (Append Mode) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
-    # 1. Download existing cnb.csv from S3
     existing_df, existing_urls = download_existing_cnb_csv()
     
-    # 2. Get current sitemap URLs
     all_urls = get_sitemap_urls()
     
     if not all_urls:
         print("Failed to get sitemap URLs!")
         return False
     
-    # 3. Filter for new URLs only
     new_urls = [url for url in all_urls if url not in existing_urls]
     print(f"Found {len(new_urls)} new auctions to scrape")
     
@@ -403,11 +387,9 @@ def main():
         print("No new auctions found - cnb.csv is up to date!")
         return True
     
-    # 4. Limit to MAX_AUCTIONS_PER_RUN
     new_urls = new_urls[:MAX_AUCTIONS_PER_RUN]
     print(f"Processing {len(new_urls)} new auctions (max {MAX_AUCTIONS_PER_RUN} per run)")
     
-    # 5. Scrape new auctions
     new_rows = []
     
     with sync_playwright() as p:
@@ -435,7 +417,6 @@ def main():
             try:
                 page = context.new_page()
                 
-                # Navigate with retries
                 for retry in range(3):
                     try:
                         page.goto(auction_url, timeout=45_000, wait_until="domcontentloaded")
@@ -446,16 +427,13 @@ def main():
                         print(f"  Retry {retry + 1}")
                         time.sleep(5)
                 
-                # Extract comprehensive data
                 data = extract_all_auction_data(page, auction_url)
                 
-                # Skip if auction is still in progress (no sale date)
                 if not data['sale_date'] or data['sale_date'].strip() == "":
                     print(f"  Skipping - auction still in progress")
                     skipped_in_progress += 1
                     continue
                 
-                # Add to new rows if we got meaningful data
                 if data['model'] or data['views'] or data['bids']:
                     new_rows.append(data)
                     successful += 1
@@ -472,7 +450,6 @@ def main():
                     page.close()
                 time.sleep(SLEEP_BETWEEN_AUCTIONS)
                 
-                # Save progress every 50 auctions
                 if len(new_rows) > 0 and len(new_rows) % 50 == 0:
                     print(f"\nSaving progress ({len(new_rows)} new rows)...")
                     temp_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
@@ -485,22 +462,18 @@ def main():
         print(f"   In-progress skipped: {skipped_in_progress}")
         print(f"   Failed: {failed}")
     
-    # 6. Append new data to existing dataframe
     if new_rows:
         print(f"\nAdding {len(new_rows)} new rows to cnb.csv")
         new_df = pd.DataFrame(new_rows)
         
-        # Combine with existing data
         updated_df = pd.concat([existing_df, new_df], ignore_index=True)
         
-        # Remove any accidental duplicates
         before_dedup = len(updated_df)
         updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep='first')
         after_dedup = len(updated_df)
         if before_dedup != after_dedup:
             print(f"Removed {before_dedup - after_dedup} duplicate rows")
         
-        # Sort by year (newest first) for better organization
         updated_df = updated_df.sort_values('year', ascending=False, na_position='last')
         
         print(f"Updated cnb.csv stats:")
@@ -509,7 +482,6 @@ def main():
         if pd.notna(updated_df['year']).any():
             print(f"   Years covered: {updated_df['year'].min():.0f} to {updated_df['year'].max():.0f}")
         
-        # 7. Upload updated file back to S3
         if upload_updated_cnb_csv(updated_df):
             print(f"Successfully updated cnb.csv in S3!")
             return True
