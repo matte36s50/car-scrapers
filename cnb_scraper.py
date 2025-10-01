@@ -101,7 +101,7 @@ def get_sitemap_urls():
         
         if response.status_code == 200:
             xml_string = response.text
-            print("Got CNB sitemap")
+            print("Got CNB sitemap via direct request")
         else:
             raise Exception(f"HTTP {response.status_code}")
             
@@ -112,61 +112,54 @@ def get_sitemap_urls():
         try:
             with sync_playwright() as p:
                 browser = p.chromium.launch(headless=True)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-                )
-                page = context.new_page()
+                page = browser.new_page()
                 
-                for attempt in range(3):
-                    try:
-                        print(f"Browser attempt {attempt + 1}/3...")
-                        page.goto(SITEMAP_URL, timeout=45_000)
-                        
-                        print("Waiting for XML content to load...")
-                        page.wait_for_selector("urlset", timeout=30_000)
-                        
-                        time.sleep(5)
-                        
-                        xml_string = page.content()
-                        print("Got CNB sitemap via browser")
-                        break
-                    except Exception as attempt_error:
-                        if attempt == 2:
-                            raise attempt_error
-                        print(f"Attempt {attempt + 1} failed, retrying...")
-                        time.sleep(10)
+                print("Loading sitemap page...")
+                page.goto(SITEMAP_URL, timeout=60_000, wait_until="load")
+                
+                print("Waiting for page to render...")
+                time.sleep(10)
+                
+                xml_string = page.content()
+                print("Got page content via browser")
                 
                 browser.close()
                 
         except Exception as browser_error:
-            print(f"Both methods failed: {browser_error}")
+            print(f"Browser method failed: {browser_error}")
             return []
 
-    if "<pre" in xml_string or "webkit-xml-viewer" in xml_string:
+    print(f"Content length: {len(xml_string)} characters")
+    print("First 200 chars:")
+    print(xml_string[:200])
+
+    if "<pre" in xml_string:
         soup_html = BeautifulSoup(xml_string, "html.parser")
         pre = soup_html.find("pre")
         if pre:
-            xml_string = pre.text
-            print("Extracted XML from pre tag")
+            xml_string = pre.get_text()
+            print("Extracted from pre tag")
 
     try:
         soup = BeautifulSoup(xml_string, "xml")
         locs = soup.find_all("loc")
         
         if not locs:
-            print("No locs found with XML parser, trying HTML parser...")
             soup = BeautifulSoup(xml_string, "html.parser")
             locs = soup.find_all("loc")
         
-        urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
+        if not locs:
+            print("No loc tags found, trying regex...")
+            urls = re.findall(r'https://carsandbids\.com/auctions/[^\s<>"]+', xml_string)
+            print(f"Found {len(urls)} URLs via regex")
+            return urls
         
+        urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
         print(f"Found {len(urls)} total CNB auction URLs")
         return urls
         
     except Exception as e:
-        print(f"Error parsing XML: {e}")
-        print("First 500 chars of content:")
-        print(xml_string[:500])
+        print(f"Error parsing: {e}")
         return []
 
 def extract_year_from_url(url):
