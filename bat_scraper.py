@@ -1,486 +1,408 @@
-import csv
 import re
-import time
 import os
-import boto3
+import json
+import csv
 import pandas as pd
 import datetime
-import requests
-from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+import boto3
 from botocore.exceptions import NoCredentialsError
-import traceback
-import json
 
-# === S3 CONFIGURATION ===
-S3_BUCKET = "my-mii-reports"
-BAT_CSV_FILENAME = "bat.csv"  # Single file to maintain
-TEMP_LOCAL_FILE = "temp_bat.csv"
-BACKUP_FILE = "bat_backup.csv"
+print("=" * 60)
+print("🚀 BAT SCRAPER STARTING")
+print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+print("=" * 60)
 
-def download_existing_bat_csv():
-    """Download existing bat.csv from S3"""
+print("\n[1/8] Importing libraries...")
+print("✓ All imports successful")
+
+# === S3 UPLOAD CODE ===
+def upload_to_s3(file_name, bucket, object_name=None):
     s3 = boto3.client('s3')
-    
+    if object_name is None:
+        object_name = file_name
     try:
-        s3.download_file(S3_BUCKET, BAT_CSV_FILENAME, TEMP_LOCAL_FILE)
-        print(f"✅ Downloaded existing bat.csv from S3")
-        
-        # Load and analyze existing data
-        df = pd.read_csv(TEMP_LOCAL_FILE)
-        print(f"📊 Existing data: {len(df)} rows, {len(df.columns)} columns")
-        
-        # Get set of existing URLs for duplicate checking
-        existing_urls = set(df['auction_url'].dropna().values)
-        print(f"📋 Found {len(existing_urls)} existing auction URLs")
-        
-        return df, existing_urls
-        
-    except s3.exceptions.NoSuchKey:
-        print(f"⚠️ No existing bat.csv found in S3, will create new one")
-        # Return empty dataframe with expected columns
-        columns = [
-            'auction_url', 'bids', 'category', 'comments', 'end_date', 
-            'end_timestamp', 'era', 'location', 'make', 'model', 
-            'origin', 'partner', 'sale_amount', 'sale_date', 'sale_type', 
-            'seller_type', 'views', 'watchers', 'year'
-        ]
-        return pd.DataFrame(columns=columns), set()
-    except Exception as e:
-        print(f"❌ Error downloading bat.csv: {e}")
-        raise
-
-def upload_updated_bat_csv(df):
-    """Upload updated bat.csv back to S3"""
-    s3 = boto3.client('s3')
-    
-    try:
-        # Save dataframe to CSV
-        df.to_csv(TEMP_LOCAL_FILE, index=False)
-        
-        # Create backup first
-        try:
-            s3.copy_object(
-                Bucket=S3_BUCKET,
-                CopySource={'Bucket': S3_BUCKET, 'Key': BAT_CSV_FILENAME},
-                Key=f"backups/{BAT_CSV_FILENAME}_{datetime.datetime.now().strftime('%Y%m%d_%H%M')}"
-            )
-            print(f"📦 Created backup of existing bat.csv")
-        except:
-            pass  # No existing file to backup
-        
-        # Upload updated file
-        s3.upload_file(TEMP_LOCAL_FILE, S3_BUCKET, BAT_CSV_FILENAME)
-        print(f"✅ Successfully uploaded updated bat.csv to S3 ({len(df)} total rows)")
-        
-        # Clean up temp file
-        os.remove(TEMP_LOCAL_FILE)
+        s3.upload_file(file_name, bucket, object_name)
+        print(f"✅ File {file_name} uploaded to s3://{bucket}/{object_name}")
         return True
-        
+    except NoCredentialsError:
+        print("❌ AWS credentials not available")
+        return False
     except Exception as e:
         print(f"❌ Upload failed: {e}")
         return False
 
-BAT_SITEMAP_URL = "https://bringatrailer.com/sitemap_auctions.xml"
-SLEEP_BETWEEN_AUCTIONS = 2.5
-MAX_AUCTIONS_PER_RUN = 500  # Limit per run to avoid timeouts
+def download_existing_bat_csv():
+    """Download existing bat.csv from S3 to append to it"""
+    print("\n[2/8] Downloading existing data from S3...")
+    s3 = boto3.client('s3')
+    try:
+        s3.download_file('my-mii-reports', 'bat.csv', 'existing_bat.csv')
+        print(f"✅ Downloaded existing bat.csv from S3")
+        
+        # Load existing data
+        existing_df = pd.read_csv('existing_bat.csv')
+        print(f"📊 Found {len(existing_df)} existing rows")
+        
+        # Get existing URLs to avoid duplicates
+        existing_urls = set(existing_df['auction_url'].dropna().values) if 'auction_url' in existing_df.columns else set()
+        
+        return existing_df, existing_urls
+    except s3.exceptions.NoSuchKey:
+        print("📋 No existing bat.csv in S3 - starting fresh")
+        return pd.DataFrame(), set()
+    except Exception as e:
+        print(f"⚠️ Could not download existing data: {e}")
+        return pd.DataFrame(), set()
 
-def get_sitemap_urls():
-    """Get BAT sitemap URLs"""
-    print("🌐 Fetching BAT sitemap...")
+def extract_year_from_url(url):
+    """Extract year from BAT URL pattern"""
+    if not url:
+        return None
     
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(BAT_SITEMAP_URL, headers=headers, timeout=30)
+        # Primary pattern: /listing/YYYY-make-model/
+        match = re.search(r'/listing/(\d{4})-', url)
+        if match:
+            year = int(match.group(1))
+            if 1900 <= year <= 2030:
+                return year
         
-        if response.status_code == 200:
-            xml_string = response.text
-            print("✅ Got BAT sitemap")
+        # Secondary pattern: look for YYYY in the URL path after listing/
+        match = re.search(r'/listing/[^/]*?(\d{4})', url)
+        if match:
+            year = int(match.group(1))
+            if 1900 <= year <= 2030:
+                return year
+        
+        return None
+    except Exception as e:
+        print(f"Error extracting year from URL {url}: {e}")
+        return None
+
+def extract_year_from_title(title):
+    """Extract year from title"""
+    if not title:
+        return None
+    
+    try:
+        # Pattern 1: Year at start "2007 Mercedes-Benz"
+        match = re.search(r'^(\d{4})\s+', title)
+        if match:
+            year = int(match.group(1))
+            if 1900 <= year <= 2030:
+                return year
+        
+        # Pattern 2: Year in parentheses "(2007)"
+        match = re.search(r'\((\d{4})\)', title)
+        if match:
+            year = int(match.group(1))
+            if 1900 <= year <= 2030:
+                return year
+        
+        # Pattern 3: Any 4-digit year in title
+        match = re.search(r'\b(\d{4})\b', title)
+        if match:
+            year = int(match.group(1))
+            if 1900 <= year <= 2030:
+                return year
+                
+        return None
+    except Exception as e:
+        print(f"Error extracting year from title {title}: {e}")
+        return None
+
+# CONFIGURATION
+BASE_URL = "https://bringatrailer.com"
+RESULTS_URL = f"{BASE_URL}/auctions/results/"
+MAX_AUCTIONS = 500
+
+SELECTORS = {
+    # results page
+    "tile": "#auctions-completed-container > div.listings-container.auctions-grid > a",
+    "load_more": "button.auctions-footer-button",
+    # auction page
+    "sale_span": "span.info-value.noborder-tiny",
+    "sale_amount": "span.info-value.noborder-tiny > strong",
+    "comments": "a > span > span.info-value",
+    "bids": "td.listing-stats-value.number-bids-value",
+    "views": "#listing-actions-stats > div:nth-child(1) > span",
+    "watchers": "#listing-actions-stats > div:nth-child(2) > span",
+    "end_span": "#listing-bid > tbody > tr:nth-child(2) > td.listing-stats-value > span",
+    "title": "h1.listing-title",
+    "seller_type": "div.item.additional",
+    "group_items": "div.group-item-wrap > div.group-item",
+}
+
+def collect_auction_urls(page):
+    """Collect auction URLs from results page"""
+    print(f"\n[4/8] Navigating to results page: {RESULTS_URL}")
+    page.goto(RESULTS_URL, timeout=60_000)
+    print("✓ Page loaded successfully")
+    
+    print(f"Waiting for auction tiles selector: {SELECTORS['tile']}")
+    page.wait_for_selector(SELECTORS["tile"])
+    print("✓ Auction tiles found")
+    
+    urls, loaded = [], 0
+    consecutive_failures = 0
+    max_failures = 3
+
+    while loaded < MAX_AUCTIONS:
+        cards = page.query_selector_all(SELECTORS["tile"])
+        current = len(cards)
+        print(f"Loaded {current}/{MAX_AUCTIONS} listings")
+
+        # If no new cards loaded, we might be at the end
+        if current == loaded:
+            consecutive_failures += 1
+            print(f"No new listings loaded (attempt {consecutive_failures}/{max_failures})")
+            if consecutive_failures >= max_failures:
+                print("Reached end of listings or load button not working")
+                break
         else:
-            raise Exception(f"HTTP {response.status_code}")
-            
-    except Exception as e:
-        print(f"❌ Sitemap fetch failed: {e}")
-        return []
+            consecutive_failures = 0
 
-    # Parse URLs
+        for card in cards[loaded: min(current, MAX_AUCTIONS)]:
+            href = card.get_attribute("href")
+            if href:
+                urls.append(href if href.startswith("http") else BASE_URL + href)
+
+        loaded = current
+        if loaded >= MAX_AUCTIONS:
+            break
+
+        # Look for load more button
+        btn = page.query_selector(SELECTORS["load_more"])
+        if not btn:
+            print("Load more button not found - reached end of listings")
+            break
+        
+        if not btn.is_visible():
+            print("Load more button not visible - reached end of listings")
+            break
+            
+        print(f"Clicking load more button...")
+        btn.scroll_into_view_if_needed()
+        page.wait_for_timeout(1000)
+        btn.click()
+        
+        try:
+            page.wait_for_function(
+                "([sel, n]) => document.querySelectorAll(sel).length > n",
+                arg=[SELECTORS["tile"], loaded],
+                timeout=20_000
+            )
+            print(f"Successfully loaded more listings")
+        except Exception as e:
+            print(f"Timeout waiting for more listings: {e}")
+            page.wait_for_timeout(3000)
+            new_cards = page.query_selector_all(SELECTORS["tile"])
+            if len(new_cards) > current:
+                print(f"Found {len(new_cards) - current} additional listings after timeout")
+                continue
+            else:
+                print("No additional listings found - stopping collection")
+                break
+
+    print(f"✓ Collection complete: found {len(urls)} auction URLs")
+    return urls
+
+def parse_auction(page, url):
+    """Parse individual auction page"""
     try:
-        soup = BeautifulSoup(xml_string, "xml")
-        urls = [loc.text for loc in soup.find_all("loc") if "/listing/" in loc.text]
-        
-        if not urls:
-            soup = BeautifulSoup(xml_string, "html.parser")
-            urls = [loc.text for loc in soup.find_all("loc") if "/listing/" in loc.text]
-        
-        print(f"🔍 Found {len(urls)} total auction URLs")
-        return urls
-        
+        page.goto(url, timeout=60_000)
+        page.wait_for_selector(SELECTORS["sale_span"], timeout=30_000)
     except Exception as e:
-        print(f"❌ Error parsing XML: {e}")
-        return []
+        print(f"    ✗ Failed to load page: {e}")
+        return {"auction_url": url, "error": "page_load_failed"}
+    
+    record = {"auction_url": url}
 
-def extract_all_auction_data(page, auction_url):
-    """Extract comprehensive data matching the bat.csv columns"""
-    
-    # Initialize with all expected fields
-    data = {
-        'auction_url': auction_url,
-        'bids': None,
-        'category': '',
-        'comments': None,
-        'end_date': '',
-        'end_timestamp': None,
-        'era': '',
-        'location': '',
-        'make': '',
-        'model': '',
-        'origin': '',
-        'partner': '',
-        'sale_amount': '',
-        'sale_date': '',
-        'sale_type': '',
-        'seller_type': '',
-        'views': '',
-        'watchers': '',
-        'year': None
-    }
-    
+    # Sale Type & optional sale_date
     try:
-        # Wait for page to load
-        page.wait_for_selector("body", timeout=15000)
-        time.sleep(2)
-        
-        page_html = page.content()
-        
-        # === TITLE AND MODEL ===
-        try:
-            title_element = page.query_selector("h1.listing-title") or page.query_selector("h1")
-            if title_element:
-                full_title = title_element.inner_text().strip()
-                data['model'] = full_title
-                
-                # Extract year from title
-                year_match = re.search(r'\b(19|20)\d{2}\b', full_title)
-                if year_match:
-                    data['year'] = int(year_match.group(0))
-                
-                # Extract make (usually first word after year)
-                words = full_title.split()
-                for i, word in enumerate(words):
-                    if not word.isdigit() and len(word) > 2 and i > 0:
-                        data['make'] = word
-                        break
-        except:
-            pass
-        
-        # === SALE AMOUNT ===
-        try:
-            bid_selectors = [
-                ".current-bid .bid-value",
-                ".current-bid",
-                ".bid-value",
-                ".winning-bid",
-                ".final-bid",
-                "span.bid-value"
-            ]
-            for selector in bid_selectors:
-                element = page.query_selector(selector)
-                if element:
-                    text = element.inner_text().strip()
-                    if '$' in text:
-                        data['sale_amount'] = text
-                        break
-        except:
-            pass
-        
-        # === STATS SECTION (Views, Comments, Bids, Watchers) ===
-        try:
-            stats_section = page.query_selector(".stats-list") or page.query_selector(".auction-stats")
-            if stats_section:
-                stats_text = stats_section.inner_text()
-                
-                # Views
-                views_match = re.search(r'([\d,]+)\s*views?', stats_text, re.IGNORECASE)
-                if views_match:
-                    data['views'] = views_match.group(1).replace(',', '')
-                
-                # Comments
-                comments_match = re.search(r'([\d,]+)\s*comments?', stats_text, re.IGNORECASE)
-                if comments_match:
-                    data['comments'] = int(comments_match.group(1).replace(',', ''))
-                
-                # Bids
-                bids_match = re.search(r'([\d,]+)\s*bids?', stats_text, re.IGNORECASE)
-                if bids_match:
-                    data['bids'] = int(bids_match.group(1).replace(',', ''))
-                
-                # Watchers
-                watchers_match = re.search(r'([\d,]+)\s*watchers?', stats_text, re.IGNORECASE)
-                if watchers_match:
-                    data['watchers'] = watchers_match.group(1).replace(',', '')
-        except:
-            pass
-        
-        # === ADDITIONAL FALLBACK EXTRACTION FROM HTML ===
-        if not data['views'] or data['views'] == '':
-            views_patterns = [
-                r'class="views"[^>]*>([\d,]+)',
-                r'data-views="([\d,]+)"',
-                r'>([\d,]+)\s*views?'
-            ]
-            for pattern in views_patterns:
-                match = re.search(pattern, page_html, re.IGNORECASE)
-                if match:
-                    data['views'] = match.group(1).replace(',', '')
-                    break
-        
-        if data['bids'] is None:
-            bids_patterns = [
-                r'class="bid-count"[^>]*>([\d,]+)',
-                r'data-bids="([\d,]+)"',
-                r'>([\d,]+)\s*bids?'
-            ]
-            for pattern in bids_patterns:
-                match = re.search(pattern, page_html, re.IGNORECASE)
-                if match:
-                    data['bids'] = int(match.group(1).replace(',', ''))
-                    break
-        
-        # === LOCATION ===
-        try:
-            location_patterns = [
-                r'class="location"[^>]*>([^<]+)',
-                r'Location:\s*([^<\n]+)',
-                r'seller-location[^>]*>([^<]+)'
-            ]
-            for pattern in location_patterns:
-                match = re.search(pattern, page_html, re.IGNORECASE)
-                if match:
-                    data['location'] = match.group(1).strip()
-                    break
-        except:
-            pass
-        
-        # === SALE DATE AND TYPE ===
-        try:
-            # Check if auction ended
-            end_time_element = page.query_selector(".time-ended") or page.query_selector(".auction-end-time")
-            if end_time_element:
-                data['sale_date'] = end_time_element.inner_text().strip()
-                data['end_date'] = data['sale_date']
-            
-            # Sale type (sold, reserve not met, etc.)
-            sale_type_element = page.query_selector(".sale-status") or page.query_selector(".auction-status")
-            if sale_type_element:
-                sale_text = sale_type_element.inner_text().lower()
-                if "sold" in sale_text:
-                    data['sale_type'] = "sold"
-                elif "reserve" in sale_text:
-                    data['sale_type'] = "reserve not met"
-                else:
-                    data['sale_type'] = sale_text
-        except:
-            pass
-        
-        # === CATEGORY AND ERA ===
-        try:
-            # Try to find category/era from tags or breadcrumbs
-            category_element = page.query_selector(".category-tag") or page.query_selector(".listing-category")
-            if category_element:
-                data['category'] = category_element.inner_text().strip()
-            
-            # Era might be in the title or tags (e.g., "1980s", "Modern", "Classic")
-            if data['year']:
-                year_int = data['year']
-                if year_int < 1950:
-                    data['era'] = 'Pre-War'
-                elif year_int < 1970:
-                    data['era'] = 'Classic'
-                elif year_int < 1990:
-                    data['era'] = 'Modern Classic'
-                elif year_int < 2010:
-                    data['era'] = 'Modern'
-                else:
-                    data['era'] = 'Contemporary'
-        except:
-            pass
-        
-        # === SELLER TYPE ===
-        try:
-            seller_patterns = [
-                r'seller[^>]*dealer',
-                r'seller[^>]*private',
-                r'class="seller-type"[^>]*>([^<]+)'
-            ]
-            for pattern in seller_patterns:
-                match = re.search(pattern, page_html, re.IGNORECASE)
-                if match:
-                    if 'dealer' in match.group(0).lower():
-                        data['seller_type'] = 'Dealer'
-                    elif 'private' in match.group(0).lower():
-                        data['seller_type'] = 'Private'
-                    break
-        except:
-            pass
-        
-        # === ORIGIN (Country of manufacture) ===
-        if data['make']:
-            make_lower = data['make'].lower()
-            if make_lower in ['bmw', 'mercedes', 'mercedes-benz', 'porsche', 'audi', 'volkswagen']:
-                data['origin'] = 'Germany'
-            elif make_lower in ['ferrari', 'lamborghini', 'alfa', 'fiat', 'maserati']:
-                data['origin'] = 'Italy'
-            elif make_lower in ['toyota', 'honda', 'nissan', 'mazda', 'subaru', 'mitsubishi']:
-                data['origin'] = 'Japan'
-            elif make_lower in ['ford', 'chevrolet', 'dodge', 'chrysler', 'gmc', 'cadillac']:
-                data['origin'] = 'USA'
-            elif make_lower in ['jaguar', 'land', 'rover', 'aston', 'bentley', 'rolls']:
-                data['origin'] = 'UK'
-        
-        print(f"    ✅ Extracted: {data['model'][:40] if data['model'] else 'Unknown'}... | "
-              f"${data['sale_amount']} | {data['views']} views | {data['bids']} bids")
-        
-        return data
-        
+        if (sale_span := page.query_selector(SELECTORS["sale_span"])):
+            text = sale_span.inner_text().strip()
+            record["sale_type"] = "sold" if text.lower().startswith("sold for") else "high bid"
+            if (date_el := sale_span.query_selector("span.date")):
+                record["sale_date"] = date_el.inner_text().replace("on ", "").strip()
     except Exception as e:
-        print(f"    ❌ Extraction error: {str(e)[:100]}")
-        traceback.print_exc()
-        return data
+        print(f"    ⚠ Error parsing sale type: {e}")
 
-def main():
-    print(f"🚀 Starting BAT Scraper (Append Mode) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    # Simple stats (amount, comments, bids, views, watchers)
+    for key in ("sale_amount", "comments", "bids", "views", "watchers"):
+        try:
+            if (el := page.query_selector(SELECTORS[key])):
+                record[key] = el.inner_text().strip()
+        except Exception as e:
+            print(f"    ⚠ Error parsing {key}: {e}")
+
+    # Auction end date & timestamp
+    try:
+        if (end_el := page.query_selector(SELECTORS["end_span"])):
+            record["end_date"] = end_el.inner_text().strip()
+            record["end_timestamp"] = end_el.get_attribute("data-ends")
+    except Exception as e:
+        print(f"    ⚠ Error parsing end date: {e}")
+
+    # Title
+    title = ""
+    try:
+        if (title_el := page.query_selector(SELECTORS["title"])):
+            title = title_el.inner_text().strip()
+            record["title"] = title
+            record["model"] = title
+    except Exception as e:
+        print(f"    ⚠ Error parsing title: {e}")
+
+    # Year extraction
+    year = None
+    try:
+        year = extract_year_from_url(url)
+        if year:
+            print(f"    ✓ Year from URL: {year}")
+        
+        if not year and title:
+            year = extract_year_from_title(title)
+            if year:
+                print(f"    ✓ Year from title: {year}")
+    except Exception as e:
+        print(f"    ⚠ Error extracting year: {e}")
     
-    # 1. Download existing bat.csv from S3
+    record["year"] = year
+
+    # Seller type
+    try:
+        if (seller_el := page.query_selector(SELECTORS["seller_type"])):
+            record["seller_type"] = seller_el.inner_text().split(":", 1)[-1].strip()
+    except Exception as e:
+        print(f"    ⚠ Error parsing seller type: {e}")
+
+    # Make, Model, Era, Origin, Category
+    try:
+        for gi in page.query_selector_all(SELECTORS["group_items"]):
+            if lbl_el := gi.query_selector("strong.group-title-label"):
+                lbl = lbl_el.inner_text().strip()
+                content = gi.inner_text().replace(lbl, "").strip()
+                if content:
+                    if lbl.lower() == 'model':
+                        record['model'] = content
+                    else:
+                        record[lbl.lower()] = content
+    except Exception as e:
+        print(f"    ⚠ Error parsing group items: {e}")
+
+    return record
+
+def run_scraper():
+    """Main scraper function"""
+    print(f"\n🚀 Starting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
     
-    # 2. Get current sitemap URLs
-    all_urls = get_sitemap_urls()
+    new_data = []
+    years_extracted = []
     
-    if not all_urls:
-        print("❌ Failed to get sitemap URLs!")
-        return False
-    
-    # 3. Filter for new URLs only
-    new_urls = [url for url in all_urls if url not in existing_urls]
-    print(f"✨ Found {len(new_urls)} new auctions to scrape")
-    
-    if not new_urls:
-        print("✅ No new auctions found - bat.csv is up to date!")
-        return True
-    
-    # 4. Limit to MAX_AUCTIONS_PER_RUN to avoid timeout
-    new_urls = new_urls[:MAX_AUCTIONS_PER_RUN]
-    print(f"🎯 Processing {len(new_urls)} new auctions (max {MAX_AUCTIONS_PER_RUN} per run)")
-    
-    # 5. Scrape new auctions
-    new_rows = []
-    
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-web-security",
-                "--disable-features=VizDisplayCompositor"
-            ]
-        )
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
+    print("\n[3/8] Initializing Playwright browser...")
+    with sync_playwright() as pw:
+        print("✓ Playwright context created")
         
-        successful = 0
-        failed = 0
+        print("Launching Chromium browser (headless mode)...")
+        browser = pw.chromium.launch(headless=True)
+        print("✓ Browser launched successfully")
         
-        for i, auction_url in enumerate(new_urls):
-            print(f"\n[{i+1}/{len(new_urls)}] Processing: {auction_url}")
-            page = None
+        print("Creating new page...")
+        page = browser.new_page()
+        print("✓ Page created successfully")
+
+        try:
+            print("\n[5/8] Collecting auction URLs...")
+            urls = collect_auction_urls(page)
             
-            try:
-                page = context.new_page()
-                
-                # Navigate with retries
-                for retry in range(3):
-                    try:
-                        page.goto(auction_url, timeout=45_000, wait_until="domcontentloaded")
-                        break
-                    except Exception as nav_error:
-                        if retry == 2:
-                            raise nav_error
-                        print(f"  🔄 Retry {retry + 1}")
-                        time.sleep(5)
-                
-                # Extract comprehensive data
-                data = extract_all_auction_data(page, auction_url)
-                
-                # Add to new rows if we got meaningful data
-                if data['model'] or data['views'] or data['bids']:
-                    new_rows.append(data)
-                    successful += 1
-                else:
-                    print(f"  ⚠️ Insufficient data extracted")
-                    failed += 1
+            print(f"\n[6/8] Filtering URLs...")
+            # Filter out URLs we've already scraped
+            urls_to_scrape = [url for url in urls if url not in existing_urls]
+            print(f"Total URLs collected: {len(urls)}")
+            print(f"Already scraped: {len(urls) - len(urls_to_scrape)}")
+            print(f"New URLs to scrape: {len(urls_to_scrape)}")
+
+            print(f"\n[7/8] Scraping individual auction pages...")
+            for i, url in enumerate(urls_to_scrape, 1):
+                try:
+                    print(f"\n[{i}/{len(urls_to_scrape)}] Processing: {url}")
+                    data = parse_auction(page, url)
+                    new_data.append(data)
                     
-            except Exception as e:
-                print(f"  ❌ Error: {str(e)[:150]}")
-                failed += 1
-                
-            finally:
-                if page:
-                    page.close()
-                time.sleep(SLEEP_BETWEEN_AUCTIONS)
-                
-                # Save progress every 50 auctions
-                if len(new_rows) > 0 and len(new_rows) % 50 == 0:
-                    print(f"\n💾 Saving progress ({len(new_rows)} new rows)...")
-                    temp_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
-                    upload_updated_bat_csv(temp_df)
+                    # Track year extraction success
+                    if data.get('year'):
+                        years_extracted.append(data['year'])
+                    
+                    year_display = f"({data.get('year', 'No Year')})"
+                    print(f"  → Result: {year_display} {data.get('sale_type', 'N/A')} – {data.get('sale_amount', 'N/A')}")
+                    
+                except Exception as e:
+                    print(f"  ✗ Error on {url}: {e}")
+
+        except Exception as e:
+            print(f"❌ Error during URL collection: {e}")
+            print("Proceeding with any URLs that were collected...")
         
-        browser.close()
-        
-        print(f"\n📊 Scraping complete: {successful} successful, {failed} failed")
+        finally:
+            print("\nClosing browser...")
+            browser.close()
+            print("✓ Browser closed")
+
+    if not new_data:
+        print("\n⚠️ No new data collected.")
+        return
+
+    print(f"\n[8/8] Processing and saving data...")
+    # Create DataFrame from new data
+    new_df = pd.DataFrame(new_data)
+    print(f"✓ Created DataFrame with {len(new_df)} new rows")
     
-    # 6. Append new data to existing dataframe
-    if new_rows:
-        print(f"\n📝 Adding {len(new_rows)} new rows to bat.csv")
-        new_df = pd.DataFrame(new_rows)
-        
-        # Combine with existing data
-        updated_df = pd.concat([existing_df, new_df], ignore_index=True)
-        
-        # Remove any accidental duplicates
-        before_dedup = len(updated_df)
-        updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep='first')
-        after_dedup = len(updated_df)
-        if before_dedup != after_dedup:
-            print(f"🧹 Removed {before_dedup - after_dedup} duplicate rows")
-        
-        # Sort by year (newest first) for better organization
-        updated_df = updated_df.sort_values('year', ascending=False, na_position='last')
-        
-        print(f"📊 Updated bat.csv stats:")
-        print(f"   Total rows: {len(updated_df)}")
-        print(f"   Total unique auctions: {updated_df['auction_url'].nunique()}")
-        print(f"   Years covered: {updated_df['year'].min()} to {updated_df['year'].max()}")
-        
-        # 7. Upload updated file back to S3
-        if upload_updated_bat_csv(updated_df):
-            print(f"🎉 Successfully updated bat.csv in S3!")
-            return True
-        else:
-            print(f"❌ Failed to upload updated bat.csv")
-            return False
+    # Combine with existing data
+    if not existing_df.empty:
+        combined_df = pd.concat([existing_df, new_df], ignore_index=True)
+        # Remove duplicates based on auction_url
+        combined_df = combined_df.drop_duplicates(subset=['auction_url'], keep='last')
+        print(f"✓ Combined data: {len(combined_df)} total rows")
     else:
-        print(f"⚠️ No new data to add")
-        return True
+        combined_df = new_df
+        print(f"✓ New dataset: {len(combined_df)} rows")
+    
+    # Save to CSV
+    combined_df.to_csv("bat.csv", index=False)
+    print(f"✅ Saved to bat.csv")
+
+    # Show summary
+    print(f"\n" + "=" * 60)
+    print("=== SUMMARY ===")
+    print(f"Total auctions in file: {len(combined_df)}")
+    print(f"New auctions added: {len(new_data)}")
+    if years_extracted:
+        print(f"Years successfully extracted: {len(years_extracted)}/{len(new_data)}")
+        success_rate = len(years_extracted) / len(new_data) * 100
+        print(f"Year extraction success rate: {success_rate:.1f}%")
+    print("=" * 60)
+
+    # Upload to S3
+    print("\n📤 Uploading bat.csv to S3...")
+    if upload_to_s3("bat.csv", "my-mii-reports"):
+        print("✅ Upload successful!")
+    else:
+        print("❌ Upload failed!")
+
+    # Clean up
+    if os.path.exists('existing_bat.csv'):
+        os.remove('existing_bat.csv')
+        print("✓ Cleaned up temporary files")
+
+    print("\n" + "=" * 60)
+    print("🎉 BAT SCRAPER COMPLETED SUCCESSFULLY")
+    print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
 
 if __name__ == "__main__":
-    try:
-        success = main()
-        exit(0 if success else 1)
-    except Exception as e:
-        print(f"❌ Fatal error: {e}")
-        traceback.print_exc()
-        exit(1)
+    run_scraper()
