@@ -89,7 +89,7 @@ SLEEP_BETWEEN_AUCTIONS = 3.0
 MAX_AUCTIONS_PER_RUN = 300
 
 def get_sitemap_urls():
-    """Get CNB auction URLs from sitemap"""
+    """Get CNB auction URLs"""
     print("Fetching CNB sitemap...")
     
     try:
@@ -97,13 +97,13 @@ def get_sitemap_urls():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
-        sitemap_index_url = "https://carsandbids.com/sitemap.xml"
-        response = requests.get(sitemap_index_url, headers=headers, timeout=30)
+        sitemap_url = "https://carsandbids.com/sitemap.xml"
+        response = requests.get(sitemap_url, headers=headers, timeout=30)
         
         if response.status_code == 200:
-            print("Got main sitemap, parsing for auction sitemap...")
             soup = BeautifulSoup(response.text, "xml")
             locs = soup.find_all("loc")
+            
             auction_sitemap = None
             for loc in locs:
                 if "auctions" in loc.text:
@@ -117,12 +117,13 @@ def get_sitemap_urls():
                     soup = BeautifulSoup(response.text, "xml")
                     locs = soup.find_all("loc")
                     urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
-                    print(f"Found {len(urls)} auction URLs from sitemap")
-                    return urls
+                    if urls:
+                        print(f"Found {len(urls)} auction URLs from sitemap")
+                        return urls
     except Exception as e:
-        print(f"Sitemap approach failed: {e}")
+        print(f"Sitemap failed: {e}")
     
-    print("Trying past auctions page as fallback...")
+    print("Trying past auctions page...")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
@@ -130,22 +131,38 @@ def get_sitemap_urls():
             
             page.goto("https://carsandbids.com/past-auctions/", timeout=60_000)
             
-            print("Waiting for page to load...")
-            time.sleep(15)
+            print("Waiting for auction cards to appear...")
+            try:
+                page.wait_for_selector("a[href*='/auctions/']", timeout=30_000)
+                print("Auction links found")
+            except:
+                print("Timeout waiting for links, trying anyway...")
             
-            for i in range(5):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(2)
+            time.sleep(10)
             
-            content = page.content()
+            for i in range(10):
+                page.evaluate("window.scrollBy(0, 1000)")
+                time.sleep(1)
+            
+            links = page.query_selector_all("a")
+            urls = set()
+            
+            for link in links:
+                href = link.get_attribute("href")
+                if href and "/auctions/" in href and href != "/past-auctions/":
+                    if href.startswith("/"):
+                        href = "https://carsandbids.com" + href
+                    urls.add(href)
+            
             browser.close()
             
-            urls = list(set(re.findall(r'https://carsandbids\.com/auctions/[a-zA-Z0-9\-]+', content)))
+            urls = list(urls)
             print(f"Found {len(urls)} auction URLs from past auctions page")
             return urls
             
     except Exception as e:
-        print(f"Past auctions page failed: {e}")
+        print(f"Past auctions failed: {e}")
+        traceback.print_exc()
         return []
 
 def extract_year_from_url(url):
