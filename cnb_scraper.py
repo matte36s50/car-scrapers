@@ -85,81 +85,67 @@ def upload_updated_cnb_csv(df):
         print(f"Upload failed: {e}")
         return False
 
-SITEMAP_URL = "https://carsandbids.com/cab-sitemap/auctions.xml"
 SLEEP_BETWEEN_AUCTIONS = 3.0
 MAX_AUCTIONS_PER_RUN = 300
 
 def get_sitemap_urls():
-    """Get CNB sitemap URLs"""
+    """Get CNB auction URLs from sitemap"""
     print("Fetching CNB sitemap...")
     
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        response = requests.get(SITEMAP_URL, headers=headers, timeout=30)
+        
+        sitemap_index_url = "https://carsandbids.com/sitemap.xml"
+        response = requests.get(sitemap_index_url, headers=headers, timeout=30)
         
         if response.status_code == 200:
-            xml_string = response.text
-            print("Got CNB sitemap via direct request")
-        else:
-            raise Exception(f"HTTP {response.status_code}")
+            print("Got main sitemap, parsing for auction sitemap...")
+            soup = BeautifulSoup(response.text, "xml")
+            locs = soup.find_all("loc")
+            auction_sitemap = None
+            for loc in locs:
+                if "auctions" in loc.text:
+                    auction_sitemap = loc.text
+                    break
+            
+            if auction_sitemap:
+                print(f"Found auctions sitemap: {auction_sitemap}")
+                response = requests.get(auction_sitemap, headers=headers, timeout=30)
+                if response.status_code == 200:
+                    soup = BeautifulSoup(response.text, "xml")
+                    locs = soup.find_all("loc")
+                    urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
+                    print(f"Found {len(urls)} auction URLs from sitemap")
+                    return urls
+    except Exception as e:
+        print(f"Sitemap approach failed: {e}")
+    
+    print("Trying past auctions page as fallback...")
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            
+            page.goto("https://carsandbids.com/past-auctions/", timeout=60_000)
+            
+            print("Waiting for page to load...")
+            time.sleep(15)
+            
+            for i in range(5):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(2)
+            
+            content = page.content()
+            browser.close()
+            
+            urls = list(set(re.findall(r'https://carsandbids\.com/auctions/[a-zA-Z0-9\-]+', content)))
+            print(f"Found {len(urls)} auction URLs from past auctions page")
+            return urls
             
     except Exception as e:
-        print(f"Direct request failed: {e}")
-        print("Trying browser method...")
-        
-        try:
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                
-                print("Loading sitemap page...")
-                page.goto(SITEMAP_URL, timeout=60_000, wait_until="load")
-                
-                print("Waiting for page to render...")
-                time.sleep(10)
-                
-                xml_string = page.content()
-                print("Got page content via browser")
-                
-                browser.close()
-                
-        except Exception as browser_error:
-            print(f"Browser method failed: {browser_error}")
-            return []
-
-    print(f"Content length: {len(xml_string)} characters")
-    print("First 200 chars:")
-    print(xml_string[:200])
-
-    if "<pre" in xml_string:
-        soup_html = BeautifulSoup(xml_string, "html.parser")
-        pre = soup_html.find("pre")
-        if pre:
-            xml_string = pre.get_text()
-            print("Extracted from pre tag")
-
-    try:
-        soup = BeautifulSoup(xml_string, "xml")
-        locs = soup.find_all("loc")
-        
-        if not locs:
-            soup = BeautifulSoup(xml_string, "html.parser")
-            locs = soup.find_all("loc")
-        
-        if not locs:
-            print("No loc tags found, trying regex...")
-            urls = re.findall(r'https://carsandbids\.com/auctions/[^\s<>"]+', xml_string)
-            print(f"Found {len(urls)} URLs via regex")
-            return urls
-        
-        urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
-        print(f"Found {len(urls)} total CNB auction URLs")
-        return urls
-        
-    except Exception as e:
-        print(f"Error parsing: {e}")
+        print(f"Past auctions page failed: {e}")
         return []
 
 def extract_year_from_url(url):
