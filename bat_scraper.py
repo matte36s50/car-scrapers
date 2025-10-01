@@ -210,65 +210,87 @@ def collect_auction_urls(page):
 
 def parse_auction(page, url):
     """Parse individual auction page"""
-    page.goto(url, timeout=60_000)
-    page.wait_for_selector(SELECTORS["sale_span"])
+    try:
+        page.goto(url, timeout=60_000)
+        page.wait_for_selector(SELECTORS["sale_span"], timeout=30_000)
+    except Exception as e:
+        print(f"    ✗ Failed to load page: {e}")
+        return {"auction_url": url, "error": "page_load_failed"}
+    
     record = {"auction_url": url}
 
     # Sale Type & optional sale_date
-    if (sale_span := page.query_selector(SELECTORS["sale_span"])):
-        text = sale_span.inner_text().strip()
-        record["sale_type"] = "sold" if text.lower().startswith("sold for") else "high bid"
-        if (date_el := sale_span.query_selector("span.date")):
-            record["sale_date"] = date_el.inner_text().replace("on ", "").strip()
+    try:
+        if (sale_span := page.query_selector(SELECTORS["sale_span"])):
+            text = sale_span.inner_text().strip()
+            record["sale_type"] = "sold" if text.lower().startswith("sold for") else "high bid"
+            if (date_el := sale_span.query_selector("span.date")):
+                record["sale_date"] = date_el.inner_text().replace("on ", "").strip()
+    except Exception as e:
+        print(f"    ⚠ Error parsing sale type: {e}")
 
     # Simple stats (amount, comments, bids, views, watchers)
     for key in ("sale_amount", "comments", "bids", "views", "watchers"):
-        if (el := page.query_selector(SELECTORS[key])):
-            record[key] = el.inner_text().strip()
+        try:
+            if (el := page.query_selector(SELECTORS[key])):
+                record[key] = el.inner_text().strip()
+        except Exception as e:
+            print(f"    ⚠ Error parsing {key}: {e}")
 
     # Auction end date & timestamp
-    if (end_el := page.query_selector(SELECTORS["end_span"])):
-        record["end_date"] = end_el.inner_text().strip()
-        record["end_timestamp"] = end_el.get_attribute("data-ends")
+    try:
+        if (end_el := page.query_selector(SELECTORS["end_span"])):
+            record["end_date"] = end_el.inner_text().strip()
+            record["end_timestamp"] = end_el.get_attribute("data-ends")
+    except Exception as e:
+        print(f"    ⚠ Error parsing end date: {e}")
 
     # Title
     title = ""
-    if (title_el := page.query_selector(SELECTORS["title"])):
-        title = title_el.inner_text().strip()
-        record["title"] = title
-        record["model"] = title  # Also store as model for compatibility
+    try:
+        if (title_el := page.query_selector(SELECTORS["title"])):
+            title = title_el.inner_text().strip()
+            record["title"] = title
+            record["model"] = title
+    except Exception as e:
+        print(f"    ⚠ Error parsing title: {e}")
 
     # Year extraction
     year = None
-    
-    # Method 1: Extract from URL
-    year = extract_year_from_url(url)
-    if year:
-        print(f"    ✓ Year from URL: {year}")
-    
-    # Method 2: Extract from title (if not found in URL)
-    if not year and title:
-        year = extract_year_from_title(title)
+    try:
+        year = extract_year_from_url(url)
         if year:
-            print(f"    ✓ Year from title: {year}")
+            print(f"    ✓ Year from URL: {year}")
+        
+        if not year and title:
+            year = extract_year_from_title(title)
+            if year:
+                print(f"    ✓ Year from title: {year}")
+    except Exception as e:
+        print(f"    ⚠ Error extracting year: {e}")
     
     record["year"] = year
 
     # Seller type
-    if (seller_el := page.query_selector(SELECTORS["seller_type"])):
-        record["seller_type"] = seller_el.inner_text().split(":", 1)[-1].strip()
+    try:
+        if (seller_el := page.query_selector(SELECTORS["seller_type"])):
+            record["seller_type"] = seller_el.inner_text().split(":", 1)[-1].strip()
+    except Exception as e:
+        print(f"    ⚠ Error parsing seller type: {e}")
 
     # Make, Model, Era, Origin, Category
-    for gi in page.query_selector_all(SELECTORS["group_items"]):
-        if lbl_el := gi.query_selector("strong.group-title-label"):
-            lbl = lbl_el.inner_text().strip()
-            content = gi.inner_text().replace(lbl, "").strip()
-            if content:
-                # Map to expected column names
-                if lbl.lower() == 'model':
-                    record['model'] = content
-                else:
-                    record[lbl.lower()] = content
+    try:
+        for gi in page.query_selector_all(SELECTORS["group_items"]):
+            if lbl_el := gi.query_selector("strong.group-title-label"):
+                lbl = lbl_el.inner_text().strip()
+                content = gi.inner_text().replace(lbl, "").strip()
+                if content:
+                    if lbl.lower() == 'model':
+                        record['model'] = content
+                    else:
+                        record[lbl.lower()] = content
+    except Exception as e:
+        print(f"    ⚠ Error parsing group items: {e}")
 
     return record
 
@@ -317,7 +339,7 @@ def run_scraper():
                         years_extracted.append(data['year'])
                     
                     year_display = f"({data.get('year', 'No Year')})"
-                    print(f"  → Result: {year_display} {data['sale_type']} – {data.get('sale_amount', 'N/A')}")
+                    print(f"  → Result: {year_display} {data.get('sale_type', 'N/A')} – {data.get('sale_amount', 'N/A')}")
                     
                 except Exception as e:
                     print(f"  ✗ Error on {url}: {e}")
