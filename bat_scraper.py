@@ -9,12 +9,12 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 
 print("=" * 60)
-print("🚀 BAT SCRAPER STARTING")
+print("BAT SCRAPER STARTING")
 print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 60)
 
 print("\n[1/8] Importing libraries...")
-print("✓ All imports successful")
+print("All imports successful")
 
 # === S3 UPLOAD CODE ===
 def upload_to_s3(file_name, bucket, object_name=None):
@@ -23,13 +23,13 @@ def upload_to_s3(file_name, bucket, object_name=None):
         object_name = file_name
     try:
         s3.upload_file(file_name, bucket, object_name)
-        print(f"✅ File {file_name} uploaded to s3://{bucket}/{object_name}")
+        print(f"File {file_name} uploaded to s3://{bucket}/{object_name}")
         return True
     except NoCredentialsError:
-        print("❌ AWS credentials not available")
+        print("AWS credentials not available")
         return False
     except Exception as e:
-        print(f"❌ Upload failed: {e}")
+        print(f"Upload failed: {e}")
         return False
 
 def download_existing_bat_csv():
@@ -38,21 +38,21 @@ def download_existing_bat_csv():
     s3 = boto3.client('s3')
     try:
         s3.download_file('my-mii-reports', 'bat.csv', 'existing_bat.csv')
-        print(f"✅ Downloaded existing bat.csv from S3")
+        print(f"Downloaded existing bat.csv from S3")
         
         # Load existing data
         existing_df = pd.read_csv('existing_bat.csv')
-        print(f"📊 Found {len(existing_df)} existing rows")
+        print(f"Found {len(existing_df)} existing rows")
         
         # Get existing URLs to avoid duplicates
         existing_urls = set(existing_df['auction_url'].dropna().values) if 'auction_url' in existing_df.columns else set()
         
         return existing_df, existing_urls
     except s3.exceptions.NoSuchKey:
-        print("📋 No existing bat.csv in S3 - starting fresh")
+        print("No existing bat.csv in S3 - starting fresh")
         return pd.DataFrame(), set()
     except Exception as e:
-        print(f"⚠️ Could not download existing data: {e}")
+        print(f"Could not download existing data: {e}")
         return pd.DataFrame(), set()
 
 def extract_year_from_url(url):
@@ -138,11 +138,11 @@ def collect_auction_urls(page):
     """Collect auction URLs from results page"""
     print(f"\n[4/8] Navigating to results page: {RESULTS_URL}")
     page.goto(RESULTS_URL, timeout=60_000)
-    print("✓ Page loaded successfully")
+    print("Page loaded successfully")
     
     print(f"Waiting for auction tiles selector: {SELECTORS['tile']}")
     page.wait_for_selector(SELECTORS["tile"])
-    print("✓ Auction tiles found")
+    print("Auction tiles found")
     
     urls, loaded = [], 0
     consecutive_failures = 0
@@ -205,26 +205,34 @@ def collect_auction_urls(page):
                 print("No additional listings found - stopping collection")
                 break
 
-    print(f"✓ Collection complete: found {len(urls)} auction URLs")
+    print(f"Collection complete: found {len(urls)} auction URLs")
     return urls
 
-def parse_auction(page, url):
-    """Parse individual auction page with aggressive timeout handling"""
+def parse_auction(browser, url):
+    """Parse individual auction page - creates fresh page each time"""
+    # Create a completely fresh page for this auction
+    page = None
     try:
-        # Close any existing page content and reload
-        try:
-            page.goto("about:blank", timeout=5000)
-        except:
-            pass
-            
+        page = browser.new_page()
+        page.set_default_timeout(30000)  # 30 second timeout
+        
         page.goto(url, timeout=45_000, wait_until="domcontentloaded")
         page.wait_for_selector(SELECTORS["sale_span"], timeout=20_000)
-    except PlaywrightTimeoutError as e:
-        print(f"    ✗ Timeout loading page: {e}")
-        return {"auction_url": url, "error": "page_load_timeout"}
+        
+    except PlaywrightTimeoutError:
+        print(f"    Timeout loading page")
+        if page:
+            page.close()
+        return {"auction_url": url, "error": "timeout"}
     except Exception as e:
-        print(f"    ✗ Failed to load page: {e}")
-        return {"auction_url": url, "error": "page_load_failed"}
+        error_str = str(e)
+        if "'dict' object has no attribute" in error_str:
+            print(f"    Dict error detected, skipping")
+        else:
+            print(f"    Failed to load: {error_str[:80]}")
+        if page:
+            page.close()
+        return {"auction_url": url, "error": "load_failed"}
     
     record = {"auction_url": url}
 
@@ -236,23 +244,23 @@ def parse_auction(page, url):
             if (date_el := sale_span.query_selector("span.date")):
                 record["sale_date"] = date_el.inner_text().replace("on ", "").strip()
     except Exception as e:
-        print(f"    ⚠ Error parsing sale type: {e}")
+        print(f"    Error parsing sale type: {str(e)[:50]}")
 
     # Simple stats (amount, comments, bids, views, watchers)
     for key in ("sale_amount", "comments", "bids", "views", "watchers"):
         try:
             if (el := page.query_selector(SELECTORS[key])):
                 record[key] = el.inner_text().strip()
-        except Exception as e:
-            print(f"    ⚠ Error parsing {key}: {e}")
+        except:
+            pass
 
     # Auction end date & timestamp
     try:
         if (end_el := page.query_selector(SELECTORS["end_span"])):
             record["end_date"] = end_el.inner_text().strip()
             record["end_timestamp"] = end_el.get_attribute("data-ends")
-    except Exception as e:
-        print(f"    ⚠ Error parsing end date: {e}")
+    except:
+        pass
 
     # Title
     title = ""
@@ -261,22 +269,22 @@ def parse_auction(page, url):
             title = title_el.inner_text().strip()
             record["title"] = title
             record["model"] = title
-    except Exception as e:
-        print(f"    ⚠ Error parsing title: {e}")
+    except:
+        pass
 
     # Year extraction
     year = None
     try:
         year = extract_year_from_url(url)
         if year:
-            print(f"    ✓ Year from URL: {year}")
+            print(f"    Year from URL: {year}")
         
         if not year and title:
             year = extract_year_from_title(title)
             if year:
-                print(f"    ✓ Year from title: {year}")
-    except Exception as e:
-        print(f"    ⚠ Error extracting year: {e}")
+                print(f"    Year from title: {year}")
+    except:
+        pass
     
     record["year"] = year
 
@@ -284,8 +292,8 @@ def parse_auction(page, url):
     try:
         if (seller_el := page.query_selector(SELECTORS["seller_type"])):
             record["seller_type"] = seller_el.inner_text().split(":", 1)[-1].strip()
-    except Exception as e:
-        print(f"    ⚠ Error parsing seller type: {e}")
+    except:
+        pass
 
     # Make, Model, Era, Origin, Category
     try:
@@ -298,14 +306,16 @@ def parse_auction(page, url):
                         record['model'] = content
                     else:
                         record[lbl.lower()] = content
-    except Exception as e:
-        print(f"    ⚠ Error parsing group items: {e}")
+    except:
+        pass
 
+    # Close the page before returning
+    page.close()
     return record
 
 def run_scraper():
     """Main scraper function"""
-    print(f"\n🚀 Starting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"\nStarting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
@@ -315,22 +325,23 @@ def run_scraper():
     
     print("\n[3/8] Initializing Playwright browser...")
     with sync_playwright() as pw:
-        print("✓ Playwright context created")
+        print("Playwright context created")
         
         print("Launching Chromium browser (headless mode)...")
         browser = pw.chromium.launch(headless=True)
-        print("✓ Browser launched successfully")
+        print("Browser launched successfully")
         
-        print("Creating new page...")
-        page = browser.new_page()
-        
-        # Set aggressive default timeout for all operations
-        page.set_default_timeout(30000)  # 30 seconds max for any operation
-        print("✓ Page created with 30s default timeout")
+        print("Creating page for URL collection...")
+        collection_page = browser.new_page()
+        print("Page created successfully")
 
         try:
             print("\n[5/8] Collecting auction URLs...")
-            urls = collect_auction_urls(page)
+            urls = collect_auction_urls(collection_page)
+            
+            # Close the collection page
+            collection_page.close()
+            print("Closed URL collection page")
             
             print(f"\n[6/8] Filtering URLs...")
             # Filter out URLs we've already scraped
@@ -343,7 +354,8 @@ def run_scraper():
             for i, url in enumerate(urls_to_scrape, 1):
                 try:
                     print(f"\n[{i}/{len(urls_to_scrape)}] Processing: {url}")
-                    data = parse_auction(page, url)
+                    # Pass browser instead of page - function creates its own page
+                    data = parse_auction(browser, url)
                     new_data.append(data)
                     
                     # Track year extraction success
@@ -353,44 +365,43 @@ def run_scraper():
                     year_display = f"({data.get('year', 'No Year')})"
                     sale_type = data.get('sale_type', 'N/A')
                     sale_amount = data.get('sale_amount', 'N/A')
-                    print(f"  → Result: {year_display} {sale_type} – {sale_amount}")
+                    print(f"  Result: {year_display} {sale_type} - {sale_amount}")
                     
                 except Exception as e:
-                    print(f"  ✗ Unexpected error on {url}: {e}")
-                    # Add a minimal record even on complete failure
-                    new_data.append({"auction_url": url, "error": str(e)})
+                    print(f"  Unexpected error: {str(e)[:80]}")
+                    new_data.append({"auction_url": url, "error": str(e)[:100]})
 
         except Exception as e:
-            print(f"❌ Error during URL collection: {e}")
+            print(f"Error during URL collection: {e}")
             print("Proceeding with any data collected...")
         
         finally:
             print("\nClosing browser...")
             browser.close()
-            print("✓ Browser closed")
+            print("Browser closed")
 
     if not new_data:
-        print("\n⚠️ No new data collected.")
+        print("\nNo new data collected.")
         return
 
     print(f"\n[8/8] Processing and saving data...")
     # Create DataFrame from new data
     new_df = pd.DataFrame(new_data)
-    print(f"✓ Created DataFrame with {len(new_df)} new rows")
+    print(f"Created DataFrame with {len(new_df)} new rows")
     
     # Combine with existing data
     if not existing_df.empty:
         combined_df = pd.concat([existing_df, new_df], ignore_index=True)
         # Remove duplicates based on auction_url
         combined_df = combined_df.drop_duplicates(subset=['auction_url'], keep='last')
-        print(f"✓ Combined data: {len(combined_df)} total rows")
+        print(f"Combined data: {len(combined_df)} total rows")
     else:
         combined_df = new_df
-        print(f"✓ New dataset: {len(combined_df)} rows")
+        print(f"New dataset: {len(combined_df)} rows")
     
     # Save to CSV
     combined_df.to_csv("bat.csv", index=False)
-    print(f"✅ Saved to bat.csv")
+    print(f"Saved to bat.csv")
 
     # Show summary
     print(f"\n" + "=" * 60)
@@ -404,19 +415,19 @@ def run_scraper():
     print("=" * 60)
 
     # Upload to S3
-    print("\n📤 Uploading bat.csv to S3...")
+    print("\nUploading bat.csv to S3...")
     if upload_to_s3("bat.csv", "my-mii-reports"):
-        print("✅ Upload successful!")
+        print("Upload successful!")
     else:
-        print("❌ Upload failed!")
+        print("Upload failed!")
 
     # Clean up
     if os.path.exists('existing_bat.csv'):
         os.remove('existing_bat.csv')
-        print("✓ Cleaned up temporary files")
+        print("Cleaned up temporary files")
 
     print("\n" + "=" * 60)
-    print("🎉 BAT SCRAPER COMPLETED SUCCESSFULLY")
+    print("BAT SCRAPER COMPLETED SUCCESSFULLY")
     print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print("=" * 60)
 
