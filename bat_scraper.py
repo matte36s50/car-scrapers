@@ -4,7 +4,7 @@ import json
 import csv
 import pandas as pd
 import datetime
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 import boto3
 from botocore.exceptions import NoCredentialsError
 
@@ -209,10 +209,19 @@ def collect_auction_urls(page):
     return urls
 
 def parse_auction(page, url):
-    """Parse individual auction page"""
+    """Parse individual auction page with aggressive timeout handling"""
     try:
-        page.goto(url, timeout=60_000)
-        page.wait_for_selector(SELECTORS["sale_span"], timeout=30_000)
+        # Close any existing page content and reload
+        try:
+            page.goto("about:blank", timeout=5000)
+        except:
+            pass
+            
+        page.goto(url, timeout=45_000, wait_until="domcontentloaded")
+        page.wait_for_selector(SELECTORS["sale_span"], timeout=20_000)
+    except PlaywrightTimeoutError as e:
+        print(f"    ✗ Timeout loading page: {e}")
+        return {"auction_url": url, "error": "page_load_timeout"}
     except Exception as e:
         print(f"    ✗ Failed to load page: {e}")
         return {"auction_url": url, "error": "page_load_failed"}
@@ -314,7 +323,10 @@ def run_scraper():
         
         print("Creating new page...")
         page = browser.new_page()
-        print("✓ Page created successfully")
+        
+        # Set aggressive default timeout for all operations
+        page.set_default_timeout(30000)  # 30 seconds max for any operation
+        print("✓ Page created with 30s default timeout")
 
         try:
             print("\n[5/8] Collecting auction URLs...")
@@ -339,14 +351,18 @@ def run_scraper():
                         years_extracted.append(data['year'])
                     
                     year_display = f"({data.get('year', 'No Year')})"
-                    print(f"  → Result: {year_display} {data.get('sale_type', 'N/A')} – {data.get('sale_amount', 'N/A')}")
+                    sale_type = data.get('sale_type', 'N/A')
+                    sale_amount = data.get('sale_amount', 'N/A')
+                    print(f"  → Result: {year_display} {sale_type} – {sale_amount}")
                     
                 except Exception as e:
-                    print(f"  ✗ Error on {url}: {e}")
+                    print(f"  ✗ Unexpected error on {url}: {e}")
+                    # Add a minimal record even on complete failure
+                    new_data.append({"auction_url": url, "error": str(e)})
 
         except Exception as e:
             print(f"❌ Error during URL collection: {e}")
-            print("Proceeding with any URLs that were collected...")
+            print("Proceeding with any data collected...")
         
         finally:
             print("\nClosing browser...")
