@@ -192,8 +192,19 @@ def clean_text(text):
     text = re.sub(r'\s*save\s*', '', text, flags=re.IGNORECASE)
     return text.strip()
 
+def extract_number_from_text(text):
+    """Extract numeric value from text, handling commas"""
+    if not text:
+        return 0
+    # Remove commas and extract first number
+    text = str(text).replace(',', '')
+    match = re.search(r'(\d+)', text)
+    if match:
+        return int(match.group(1))
+    return 0
+
 def extract_all_auction_data(page, auction_url):
-    """Extract comprehensive data from CNB auction page"""
+    """Extract comprehensive data from CNB auction page - FIXED BIDS EXTRACTION"""
     
     data = {
         "model": "",
@@ -224,6 +235,7 @@ def extract_all_auction_data(page, auction_url):
         page.wait_for_selector("body", timeout=15000)
         time.sleep(2)
         
+        # Extract title/model
         try:
             title_element = page.query_selector("h1")
             if title_element:
@@ -231,12 +243,14 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
+        # Extract year from URL first
         data["year"] = extract_year_from_url(auction_url)
         if not data["year"] and data["model"]:
             year_match = re.search(r'\b(19|20)\d{2}\b', data["model"])
             if year_match:
                 data["year"] = int(year_match.group(0))
         
+        # Extract sale amount
         try:
             bid_selectors = [
                 "span.bid-value",
@@ -254,6 +268,7 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
+        # Extract sale date and type
         try:
             date_element = page.query_selector("span.time-ended") or page.query_selector(".auction-end-time")
             if date_element:
@@ -271,33 +286,37 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
+        # CRITICAL FIX: Extract bids as NUMBER, not year
         try:
             bids_element = page.query_selector("li.num-bids")
             if bids_element:
                 bids_text = bids_element.inner_text()
-                bids_match = re.search(r'(\d+)', bids_text)
-                if bids_match:
-                    data["bids"] = int(bids_match.group(1))
-        except:
-            pass
+                # Extract ONLY the bid count, not anything else
+                data["bids"] = extract_number_from_text(bids_text)
+                print(f"    DEBUG: Raw bids text: '{bids_text}' -> Extracted: {data['bids']}")
+        except Exception as e:
+            print(f"    Error extracting bids: {e}")
+            data["bids"] = 0
         
+        # Extract views
         try:
             views_element = page.query_selector("li span.views")
             if views_element:
-                data["views"] = views_element.inner_text().replace(",", "")
+                views_text = views_element.inner_text()
+                data["views"] = extract_number_from_text(views_text)
         except:
             pass
         
+        # Extract comments
         try:
             comments_element = page.query_selector(".comments-count") or page.query_selector(".comment-count")
             if comments_element:
                 comments_text = comments_element.inner_text()
-                comments_match = re.search(r'(\d+)', comments_text)
-                if comments_match:
-                    data["comments"] = int(comments_match.group(1))
+                data["comments"] = extract_number_from_text(comments_text)
         except:
             pass
         
+        # Extract seller
         try:
             seller_element = page.query_selector("li.seller")
             if seller_element:
@@ -305,6 +324,7 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
+        # Extract vehicle facts
         try:
             fact_containers = page.query_selector_all("dl")
             for container in fact_containers:
@@ -345,18 +365,25 @@ def extract_all_auction_data(page, auction_url):
         except Exception as e:
             print(f"    Facts extraction error: {e}")
         
+        # Infer make from model if missing
         if not data["make"] and data["model"]:
             model_words = data["model"].split()
             if len(model_words) > 0:
                 common_makes = ['Toyota', 'Honda', 'Ford', 'Chevrolet', 'BMW', 'Mercedes', 
-                               'Audi', 'Volkswagen', 'Nissan', 'Mazda', 'Porsche', 'Ferrari']
+                               'Audi', 'Volkswagen', 'Nissan', 'Mazda', 'Porsche', 'Ferrari',
+                               'Lamborghini', 'McLaren']
                 for word in model_words:
                     if any(make.lower() == word.lower() for make in common_makes):
                         data["make"] = word
                         break
         
+        # VALIDATION: Ensure bids is not a year
+        if data["bids"] >= 1900 and data["bids"] <= 2030:
+            print(f"    WARNING: Bids value {data['bids']} looks like a year! Setting to 0.")
+            data["bids"] = 0
+        
         print(f"    Extracted: {data['model'][:40] if data['model'] else 'Unknown'}... | "
-              f"${data['sale_amount']} | {data['views']} views | {data['bids']} bids")
+              f"${data['sale_amount']} | {data['views']} views | {data['bids']} bids | Year: {data['year']}")
         
         return data
         
@@ -366,7 +393,7 @@ def extract_all_auction_data(page, auction_url):
         return data
 
 def main():
-    print(f"Starting CNB Scraper (Append Mode) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Starting CNB Scraper (Append Mode with FIXED BIDS) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     existing_df, existing_urls = download_existing_cnb_csv()
     
@@ -477,6 +504,13 @@ def main():
         print(f"   Total unique auctions: {updated_df['auction_url'].nunique()}")
         if pd.notna(updated_df['year']).any():
             print(f"   Years covered: {updated_df['year'].min():.0f} to {updated_df['year'].max():.0f}")
+        
+        # CRITICAL: Validate bids column
+        bad_bids = updated_df[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= 2030)]
+        if len(bad_bids) > 0:
+            print(f"\n⚠️  WARNING: Found {len(bad_bids)} entries with year-like bids values!")
+            print("   Setting these to 0...")
+            updated_df.loc[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= 2030), 'bids'] = 0
         
         if upload_updated_cnb_csv(updated_df):
             print(f"Successfully updated cnb.csv in S3!")
