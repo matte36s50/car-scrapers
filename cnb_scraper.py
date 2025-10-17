@@ -85,61 +85,80 @@ def upload_updated_cnb_csv(df):
         print(f"Upload failed: {e}")
         return False
 
-SLEEP_BETWEEN_AUCTIONS = 3.0
-MAX_AUCTIONS_PER_RUN = 300
+# Incremental mode for GitHub Actions
+SLEEP_BETWEEN_AUCTIONS = 2.0 if os.getenv('GITHUB_ACTIONS') == 'true' else 3.0
+MAX_AUCTIONS_PER_RUN = int(os.getenv('MAX_AUCTIONS_PER_RUN', '100' if os.getenv('GITHUB_ACTIONS') == 'true' else '300'))
+
+print(f"Running in {'GitHub Actions' if os.getenv('GITHUB_ACTIONS') else 'local'} mode")
+print(f"Max auctions per run: {MAX_AUCTIONS_PER_RUN}")
+print(f"Sleep between auctions: {SLEEP_BETWEEN_AUCTIONS}s")
 
 def get_sitemap_urls():
-    """Get CNB auction URLs"""
+    """Get CNB auction URLs - OPTIMIZED FOR SPEED"""
     print("Fetching CNB sitemap...")
     
+    # METHOD 1: Direct requests (FAST - no browser needed)
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/xml,text/xml,*/*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive'
         }
         
+        print("Trying main sitemap...")
         sitemap_url = "https://carsandbids.com/sitemap.xml"
-        response = requests.get(sitemap_url, headers=headers, timeout=30)
+        response = requests.get(sitemap_url, headers=headers, timeout=15)
         
         if response.status_code == 200:
+            print(f"✓ Got main sitemap ({len(response.text)} chars)")
             soup = BeautifulSoup(response.text, "xml")
             locs = soup.find_all("loc")
             
+            # Find auctions sitemap
             auction_sitemap = None
             for loc in locs:
-                if "auctions" in loc.text:
+                if "auctions" in loc.text.lower():
                     auction_sitemap = loc.text
                     break
             
             if auction_sitemap:
-                print(f"Found auctions sitemap: {auction_sitemap}")
-                response = requests.get(auction_sitemap, headers=headers, timeout=30)
+                print(f"✓ Found auctions sitemap: {auction_sitemap}")
+                response = requests.get(auction_sitemap, headers=headers, timeout=15)
                 if response.status_code == 200:
+                    print(f"✓ Got auctions sitemap ({len(response.text)} chars)")
                     soup = BeautifulSoup(response.text, "xml")
                     locs = soup.find_all("loc")
                     urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
+                    
                     if urls:
-                        print(f"Found {len(urls)} auction URLs from sitemap")
+                        print(f"✓ Found {len(urls)} auction URLs via sitemap (FAST METHOD)")
                         return urls
+                    else:
+                        print("⚠ No auction URLs in sitemap")
     except Exception as e:
-        print(f"Sitemap failed: {e}")
+        print(f"✗ Sitemap method failed: {e}")
     
-    print("Trying past auctions page...")
+    # METHOD 2: Fallback to past auctions page (SLOWER - uses Playwright)
+    print("\nFalling back to past auctions page...")
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
             page = browser.new_page()
             
+            print("Loading past auctions page...")
             page.goto("https://carsandbids.com/past-auctions/", timeout=60_000)
             
             print("Waiting for auction cards to appear...")
             try:
                 page.wait_for_selector("a[href*='/auctions/']", timeout=30_000)
-                print("Auction links found")
+                print("✓ Auction links found")
             except:
-                print("Timeout waiting for links, trying anyway...")
+                print("⚠ Timeout waiting for links, trying anyway...")
             
             time.sleep(10)
             
+            # Scroll to load more
             for i in range(10):
                 page.evaluate("window.scrollBy(0, 1000)")
                 time.sleep(1)
@@ -157,11 +176,11 @@ def get_sitemap_urls():
             browser.close()
             
             urls = list(urls)
-            print(f"Found {len(urls)} auction URLs from past auctions page")
+            print(f"✓ Found {len(urls)} auction URLs from past auctions page")
             return urls
             
     except Exception as e:
-        print(f"Past auctions failed: {e}")
+        print(f"✗ Past auctions failed: {e}")
         traceback.print_exc()
         return []
 
@@ -196,7 +215,6 @@ def extract_number_from_text(text):
     """Extract numeric value from text, handling commas"""
     if not text:
         return 0
-    # Remove commas and extract first number
     text = str(text).replace(',', '')
     match = re.search(r'(\d+)', text)
     if match:
@@ -235,7 +253,6 @@ def extract_all_auction_data(page, auction_url):
         page.wait_for_selector("body", timeout=15000)
         time.sleep(2)
         
-        # Extract title/model
         try:
             title_element = page.query_selector("h1")
             if title_element:
@@ -243,14 +260,12 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract year from URL first
         data["year"] = extract_year_from_url(auction_url)
         if not data["year"] and data["model"]:
             year_match = re.search(r'\b(19|20)\d{2}\b', data["model"])
             if year_match:
                 data["year"] = int(year_match.group(0))
         
-        # Extract sale amount
         try:
             bid_selectors = [
                 "span.bid-value",
@@ -268,7 +283,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract sale date and type
         try:
             date_element = page.query_selector("span.time-ended") or page.query_selector(".auction-end-time")
             if date_element:
@@ -291,14 +305,10 @@ def extract_all_auction_data(page, auction_url):
             bids_element = page.query_selector("li.num-bids")
             if bids_element:
                 bids_text = bids_element.inner_text()
-                # Extract ONLY the bid count, not anything else
                 data["bids"] = extract_number_from_text(bids_text)
-                print(f"    DEBUG: Raw bids text: '{bids_text}' -> Extracted: {data['bids']}")
         except Exception as e:
-            print(f"    Error extracting bids: {e}")
             data["bids"] = 0
         
-        # Extract views
         try:
             views_element = page.query_selector("li span.views")
             if views_element:
@@ -307,7 +317,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract comments
         try:
             comments_element = page.query_selector(".comments-count") or page.query_selector(".comment-count")
             if comments_element:
@@ -316,7 +325,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract seller
         try:
             seller_element = page.query_selector("li.seller")
             if seller_element:
@@ -324,7 +332,6 @@ def extract_all_auction_data(page, auction_url):
         except:
             pass
         
-        # Extract vehicle facts
         try:
             fact_containers = page.query_selector_all("dl")
             for container in fact_containers:
@@ -363,9 +370,8 @@ def extract_all_auction_data(page, auction_url):
                     except:
                         continue
         except Exception as e:
-            print(f"    Facts extraction error: {e}")
+            pass
         
-        # Infer make from model if missing
         if not data["make"] and data["model"]:
             model_words = data["model"].split()
             if len(model_words) > 0:
@@ -379,35 +385,34 @@ def extract_all_auction_data(page, auction_url):
         
         # VALIDATION: Ensure bids is not a year
         if data["bids"] >= 1900 and data["bids"] <= 2030:
-            print(f"    WARNING: Bids value {data['bids']} looks like a year! Setting to 0.")
+            print(f"    ⚠ WARNING: Bids value {data['bids']} looks like a year! Setting to 0.")
             data["bids"] = 0
         
-        print(f"    Extracted: {data['model'][:40] if data['model'] else 'Unknown'}... | "
+        print(f"    ✓ {data['model'][:40] if data['model'] else 'Unknown'}... | "
               f"${data['sale_amount']} | {data['views']} views | {data['bids']} bids | Year: {data['year']}")
         
         return data
         
     except Exception as e:
-        print(f"    Extraction error: {str(e)[:100]}")
-        traceback.print_exc()
+        print(f"    ✗ Extraction error: {str(e)[:100]}")
         return data
 
 def main():
-    print(f"Starting CNB Scraper (Append Mode with FIXED BIDS) - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"Starting CNB Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     existing_df, existing_urls = download_existing_cnb_csv()
     
     all_urls = get_sitemap_urls()
     
     if not all_urls:
-        print("Failed to get sitemap URLs!")
+        print("✗ Failed to get sitemap URLs!")
         return False
     
     new_urls = [url for url in all_urls if url not in existing_urls]
     print(f"Found {len(new_urls)} new auctions to scrape")
     
     if not new_urls:
-        print("No new auctions found - cnb.csv is up to date!")
+        print("✓ No new auctions found - cnb.csv is up to date!")
         return True
     
     new_urls = new_urls[:MAX_AUCTIONS_PER_RUN]
@@ -434,7 +439,7 @@ def main():
         skipped_in_progress = 0
         
         for i, auction_url in enumerate(new_urls):
-            print(f"\n[{i+1}/{len(new_urls)}] Processing: {auction_url}")
+            print(f"\n[{i+1}/{len(new_urls)}] {auction_url}")
             page = None
             
             try:
@@ -453,7 +458,7 @@ def main():
                 data = extract_all_auction_data(page, auction_url)
                 
                 if not data['sale_date'] or data['sale_date'].strip() == "":
-                    print(f"  Skipping - auction still in progress")
+                    print(f"  ⊘ Skipping - auction in progress")
                     skipped_in_progress += 1
                     continue
                 
@@ -461,11 +466,11 @@ def main():
                     new_rows.append(data)
                     successful += 1
                 else:
-                    print(f"  Insufficient data extracted")
+                    print(f"  ⚠ Insufficient data")
                     failed += 1
                     
             except Exception as e:
-                print(f"  Error: {str(e)[:150]}")
+                print(f"  ✗ Error: {str(e)[:150]}")
                 failed += 1
                 
             finally:
@@ -474,19 +479,21 @@ def main():
                 time.sleep(SLEEP_BETWEEN_AUCTIONS)
                 
                 if len(new_rows) > 0 and len(new_rows) % 50 == 0:
-                    print(f"\nSaving progress ({len(new_rows)} new rows)...")
+                    print(f"\n💾 Saving progress ({len(new_rows)} rows)...")
                     temp_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
                     upload_updated_cnb_csv(temp_df)
         
         browser.close()
         
-        print(f"\nScraping complete:")
-        print(f"   Successful: {successful}")
-        print(f"   In-progress skipped: {skipped_in_progress}")
-        print(f"   Failed: {failed}")
+        print(f"\n{'='*60}")
+        print(f"Scraping complete:")
+        print(f"   ✓ Successful: {successful}")
+        print(f"   ⊘ In-progress: {skipped_in_progress}")
+        print(f"   ✗ Failed: {failed}")
+        print(f"{'='*60}")
     
     if new_rows:
-        print(f"\nAdding {len(new_rows)} new rows to cnb.csv")
+        print(f"\n💾 Saving {len(new_rows)} new rows...")
         new_df = pd.DataFrame(new_rows)
         
         updated_df = pd.concat([existing_df, new_df], ignore_index=True)
@@ -495,31 +502,30 @@ def main():
         updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep='first')
         after_dedup = len(updated_df)
         if before_dedup != after_dedup:
-            print(f"Removed {before_dedup - after_dedup} duplicate rows")
+            print(f"Removed {before_dedup - after_dedup} duplicates")
         
         updated_df = updated_df.sort_values('year', ascending=False, na_position='last')
         
-        print(f"Updated cnb.csv stats:")
+        print(f"\n📊 Final stats:")
         print(f"   Total rows: {len(updated_df)}")
-        print(f"   Total unique auctions: {updated_df['auction_url'].nunique()}")
+        print(f"   Unique auctions: {updated_df['auction_url'].nunique()}")
         if pd.notna(updated_df['year']).any():
-            print(f"   Years covered: {updated_df['year'].min():.0f} to {updated_df['year'].max():.0f}")
+            print(f"   Years: {updated_df['year'].min():.0f}-{updated_df['year'].max():.0f}")
         
-        # CRITICAL: Validate bids column
+        # Validate bids
         bad_bids = updated_df[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= 2030)]
         if len(bad_bids) > 0:
-            print(f"\n⚠️  WARNING: Found {len(bad_bids)} entries with year-like bids values!")
-            print("   Setting these to 0...")
+            print(f"\n⚠  WARNING: {len(bad_bids)} entries with suspicious bids, fixing...")
             updated_df.loc[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= 2030), 'bids'] = 0
         
         if upload_updated_cnb_csv(updated_df):
-            print(f"Successfully updated cnb.csv in S3!")
+            print(f"\n✅ Successfully updated cnb.csv in S3!")
             return True
         else:
-            print(f"Failed to upload updated cnb.csv")
+            print(f"\n✗ Failed to upload")
             return False
     else:
-        print(f"No new completed auctions to add")
+        print(f"\n✓ No new completed auctions")
         return True
 
 if __name__ == "__main__":
@@ -527,6 +533,6 @@ if __name__ == "__main__":
         success = main()
         exit(0 if success else 1)
     except Exception as e:
-        print(f"Fatal error: {e}")
+        print(f"\n✗ Fatal error: {e}")
         traceback.print_exc()
         exit(1)
