@@ -9,7 +9,7 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 
 print("=" * 60)
-print("BAT SCRAPER STARTING")
+print("BAT SCRAPER STARTING (FIXED MODEL PARSING)")
 print(f"Timestamp: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 print("=" * 60)
 
@@ -111,6 +111,70 @@ def extract_year_from_title(title):
     except Exception as e:
         print(f"Error extracting year from title {title}: {e}")
         return None
+
+def extract_model_from_url(url):
+    """
+    Extract proper model name from BaT URL slug
+    Example: /listing/2007-mercedes-benz-sl65-amg-37/ -> SL65 AMG
+    """
+    if not url:
+        return None
+    
+    try:
+        # Extract the slug between /listing/ and the trailing /
+        match = re.search(r'/listing/([^/]+)/', url)
+        if not match:
+            return None
+        
+        slug = match.group(1)
+        
+        # Remove trailing number if present (e.g., "-37" in the example)
+        slug = re.sub(r'-\d+$', '', slug)
+        
+        # Split by hyphens
+        parts = slug.split('-')
+        
+        # Remove year if it's the first part
+        if parts and re.match(r'^\d{4}$', parts[0]):
+            parts = parts[1:]
+        
+        # Remove common make names (we already have "make" field)
+        common_makes = {'mercedes', 'benz', 'porsche', 'ferrari', 'bmw', 'audi', 
+                       'ford', 'chevrolet', 'dodge', 'toyota', 'honda', 'nissan'}
+        parts = [p for p in parts if p.lower() not in common_makes]
+        
+        # Join remaining parts with spaces and title case
+        if parts:
+            model = ' '.join(parts).upper()
+            # Keep common patterns uppercase (AMG, GT, SL, etc.)
+            return model
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error extracting model from URL {url}: {e}")
+        return None
+
+def is_generic_model(model_str):
+    """
+    Check if the model string is too generic and should be replaced
+    """
+    if not model_str:
+        return True
+    
+    model_lower = model_str.lower().strip()
+    
+    # Generic patterns that should be replaced
+    generic_patterns = [
+        'mercedes-benz amg',
+        'mercedes amg',
+        'bmw m',
+        'porsche turbo',
+        'ford mustang',  # Too generic without generation
+        'chevrolet corvette',  # Too generic without generation
+    ]
+    
+    return any(pattern in model_lower for pattern in generic_patterns)
 
 # CONFIGURATION
 BASE_URL = "https://bringatrailer.com"
@@ -268,7 +332,7 @@ def parse_auction(browser, url):
         if (title_el := page.query_selector(SELECTORS["title"])):
             title = title_el.inner_text().strip()
             record["title"] = title
-            record["model"] = title
+            record["model"] = title  # Initial fallback
     except:
         pass
 
@@ -295,7 +359,8 @@ def parse_auction(browser, url):
     except:
         pass
 
-    # Make, Model, Era, Origin, Category
+    # Make, Model, Era, Origin, Category from group items
+    group_item_model = None
     try:
         for gi in page.query_selector_all(SELECTORS["group_items"]):
             if lbl_el := gi.query_selector("strong.group-title-label"):
@@ -303,11 +368,33 @@ def parse_auction(browser, url):
                 content = gi.inner_text().replace(lbl, "").strip()
                 if content:
                     if lbl.lower() == 'model':
-                        record['model'] = content
+                        group_item_model = content
+                        # Don't set it yet - we'll validate it first
                     else:
                         record[lbl.lower()] = content
     except:
         pass
+
+    # SMART MODEL SELECTION
+    # Priority: URL slug (if group-item is generic) > group-item > title
+    url_model = extract_model_from_url(url)
+    
+    if group_item_model and not is_generic_model(group_item_model):
+        # Group item model is good, use it
+        record['model'] = group_item_model
+        print(f"    Model from group-item: {group_item_model}")
+    elif url_model:
+        # Use URL slug model (group-item was generic or missing)
+        record['model'] = url_model
+        if group_item_model:
+            print(f"    Model from URL (generic group-item '{group_item_model}' replaced): {url_model}")
+        else:
+            print(f"    Model from URL: {url_model}")
+    elif group_item_model:
+        # Use generic model as last resort
+        record['model'] = group_item_model
+        print(f"    Model from group-item (generic): {group_item_model}")
+    # else: Keep the title as model (already set earlier)
 
     # Close the page before returning
     page.close()
@@ -322,6 +409,7 @@ def run_scraper():
     
     new_data = []
     years_extracted = []
+    models_from_url = 0
     
     print("\n[3/8] Initializing Playwright browser...")
     with sync_playwright() as pw:
@@ -362,10 +450,15 @@ def run_scraper():
                     if data.get('year'):
                         years_extracted.append(data['year'])
                     
+                    # Track URL model extraction
+                    if 'Model from URL' in str(data):
+                        models_from_url += 1
+                    
                     year_display = f"({data.get('year', 'No Year')})"
                     sale_type = data.get('sale_type', 'N/A')
                     sale_amount = data.get('sale_amount', 'N/A')
-                    print(f"  Result: {year_display} {sale_type} - {sale_amount}")
+                    model_display = data.get('model', 'N/A')[:40]
+                    print(f"  Result: {year_display} {model_display} - {sale_type} - {sale_amount}")
                     
                 except Exception as e:
                     print(f"  Unexpected error: {str(e)[:80]}")
@@ -412,6 +505,7 @@ def run_scraper():
         print(f"Years successfully extracted: {len(years_extracted)}/{len(new_data)}")
         success_rate = len(years_extracted) / len(new_data) * 100
         print(f"Year extraction success rate: {success_rate:.1f}%")
+    print(f"Models extracted from URL: {models_from_url}")
     print("=" * 60)
 
     # Upload to S3
