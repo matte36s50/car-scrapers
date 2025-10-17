@@ -218,14 +218,51 @@ def clean_and_process_data(df):
     else:
         df['comments_numeric'] = 0
     
-    # Add quarter information
-    if 'scraped_date' in df.columns:
-        df['quarter'] = pd.to_datetime(df['scraped_date'], errors='coerce').dt.to_period('Q').astype(str)
-    elif 'sale_date' in df.columns:
-        df['quarter'] = pd.to_datetime(df['sale_date'], errors='coerce').dt.to_period('Q').astype(str)
-    else:
-        current_quarter = f"{datetime.datetime.now().year}Q{(datetime.datetime.now().month-1)//3 + 1}"
-        df['quarter'] = current_quarter
+    # Add quarter information with smart fallback
+    def assign_quarter(row):
+        """Assign quarter with multiple fallback strategies"""
+        
+        # Strategy 1: Try scraped_date
+        if 'scraped_date' in row and pd.notna(row['scraped_date']):
+            try:
+                date = pd.to_datetime(row['scraped_date'], errors='coerce')
+                if pd.notna(date):
+                    return date.to_period('Q').strftime('%Y') + 'Q' + str(date.quarter)
+            except:
+                pass
+        
+        # Strategy 2: Try sale_date
+        if 'sale_date' in row and pd.notna(row['sale_date']):
+            try:
+                date = pd.to_datetime(row['sale_date'], errors='coerce')
+                if pd.notna(date):
+                    return date.to_period('Q').strftime('%Y') + 'Q' + str(date.quarter)
+            except:
+                pass
+        
+        # Strategy 3: Try end_date (for BAT)
+        if 'end_date' in row and pd.notna(row['end_date']):
+            try:
+                date = pd.to_datetime(row['end_date'], errors='coerce')
+                if pd.notna(date):
+                    return date.to_period('Q').strftime('%Y') + 'Q' + str(date.quarter)
+            except:
+                pass
+        
+        # Strategy 4: Use current quarter as fallback
+        # Most recent auctions are likely from current or recent quarter
+        return f"{datetime.datetime.now().year}Q{(datetime.datetime.now().month-1)//3 + 1}"
+    
+    df['quarter'] = df.apply(assign_quarter, axis=1)
+    
+    # Remove any remaining NaT quarters (shouldn't happen with fallback, but be safe)
+    before_nat_filter = len(df)
+    df = df[df['quarter'] != 'NaT']
+    df = df[df['quarter'].notna()]
+    nat_filtered = before_nat_filter - len(df)
+    
+    if nat_filtered > 0:
+        print(f"\n   ⚠️  Filtered out {nat_filtered} entries with unparseable dates")
     
     # Extract year from multiple possible sources
     def extract_year(row):
@@ -269,6 +306,12 @@ def clean_and_process_data(df):
     print(f"   Average views (after filtering): {df['views_numeric'].mean():.0f}")
     print(f"   Average bids: {df['bids_numeric'].mean():.1f}")
     print(f"   Data quality: {len(df)/original_count*100:.1f}% retention")
+    
+    # Show quarter distribution
+    quarter_dist = df['quarter'].value_counts().sort_index()
+    print(f"\n📅 Quarter Distribution:")
+    for quarter, count in quarter_dist.items():
+        print(f"   {quarter}: {count} auctions")
     
     return df
 
@@ -376,7 +419,12 @@ def generate_insights(mii_results):
     print("\n📊 GENERATING INSIGHTS")
     print("="*60)
     
-    latest_quarter = mii_results['quarter'].iloc[0] if len(mii_results) > 0 else 'Unknown'
+    # Filter out NaT quarters if any remain
+    mii_results = mii_results[mii_results['quarter'] != 'NaT'].copy()
+    
+    # Get latest valid quarter
+    valid_quarters = sorted([q for q in mii_results['quarter'].unique() if q != 'NaT'], reverse=True)
+    latest_quarter = valid_quarters[0] if valid_quarters else 'Unknown'
     latest_data = mii_results[mii_results['quarter'] == latest_quarter]
     
     # Top performers
