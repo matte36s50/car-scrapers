@@ -143,8 +143,11 @@ def load_scraped_data():
     return combined_df
 
 def clean_and_process_data(df):
-    """Clean and standardize the scraped data"""
+    """Clean and standardize the scraped data with quality filters"""
     print("🧹 Cleaning and processing data...")
+    
+    # Track original count for reporting
+    original_count = len(df)
     
     # Ensure we have required columns
     required_cols = ['model', 'views', 'bids', 'data_source']
@@ -170,6 +173,44 @@ def clean_and_process_data(df):
     
     df['views_numeric'] = df['views'].apply(extract_number)
     df['bids_numeric'] = df['bids'].apply(extract_number)
+    
+    # ============================================
+    # DATA QUALITY FILTER: Remove low-view CNB entries
+    # ============================================
+    print("\n⚠️  DATA QUALITY FILTERING:")
+    
+    # Separate by data source
+    bat_data = df[df['data_source'] == 'BAT'].copy()
+    cnb_data = df[df['data_source'] == 'CNB'].copy()
+    
+    print(f"   BAT entries: {len(bat_data)}")
+    print(f"   BAT avg views: {bat_data['views_numeric'].mean():.0f}")
+    print(f"   CNB entries: {len(cnb_data)}")
+    print(f"   CNB avg views: {cnb_data['views_numeric'].mean():.0f}")
+    
+    # Filter CNB entries with suspiciously low views
+    # Views < 50 are likely scraping errors (even mundane cars get 500+ views on CNB)
+    low_views_cnb = cnb_data[cnb_data['views_numeric'] < 50]
+    print(f"\n   🔍 Found {len(low_views_cnb)} CNB entries with views < 50")
+    
+    if len(low_views_cnb) > 0:
+        print(f"   These appear to be scraping errors and will be EXCLUDED")
+        print(f"   Sample excluded entries:")
+        for _, row in low_views_cnb.head(5).iterrows():
+            print(f"      - {row['model'][:40]}: {row['views_numeric']} views")
+    
+    # Apply filter: Keep all BAT data, filter CNB data
+    cnb_filtered = cnb_data[cnb_data['views_numeric'] >= 50]
+    df = pd.concat([bat_data, cnb_filtered], ignore_index=True)
+    
+    filtered_count = original_count - len(df)
+    print(f"\n   ✅ Filtered out {filtered_count} low-quality entries")
+    print(f"   Retaining {len(df)} high-quality entries ({len(df)/original_count*100:.1f}%)")
+    print(f"   Final: BAT={len(bat_data)}, CNB={len(cnb_filtered)}")
+    
+    # ============================================
+    # Continue with normal processing
+    # ============================================
     
     # Handle comments if the column exists
     if 'comments' in df.columns:
@@ -224,15 +265,16 @@ def clean_and_process_data(df):
     else:
         df['sale_amount_numeric'] = 0
     
-    print(f"✅ Cleaned data: {len(df)} records with {df['model'].nunique()} unique models")
-    print(f"   Average views: {df['views_numeric'].mean():.0f}")
+    print(f"\n✅ Cleaned data: {len(df)} records with {df['model'].nunique()} unique models")
+    print(f"   Average views (after filtering): {df['views_numeric'].mean():.0f}")
     print(f"   Average bids: {df['bids_numeric'].mean():.1f}")
+    print(f"   Data quality: {len(df)/original_count*100:.1f}% retention")
     
     return df
 
 def calculate_mii_scores(df):
     """Calculate MII scores for the models"""
-    print("🧮 Calculating MII scores...")
+    print("\n🧮 Calculating MII scores...")
     
     # Get Instagram estimates
     all_models = df['model'].unique()
@@ -377,7 +419,7 @@ def generate_insights(mii_results):
     return latest_quarter
 
 def main():
-    print("🚀 MII Calculator - Single File Version")
+    print("🚀 MII Calculator with Data Quality Filters")
     print(f"⏰ Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     # Load scraped data from S3
@@ -386,7 +428,7 @@ def main():
         print("❌ No data to process!")
         return False
     
-    # Clean and process
+    # Clean and process (includes quality filtering)
     clean_data = clean_and_process_data(raw_data)
     if clean_data.empty:
         print("❌ No clean data to process!")
