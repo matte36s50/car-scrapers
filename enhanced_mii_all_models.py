@@ -7,6 +7,7 @@
 # - Comprehensive validation
 # - Enhanced analytics (tiers, YoY, cohort analysis)
 # - Improved documentation
+# - GitHub Pages integration
 # ---------------------------------------------------------------
 
 import os
@@ -15,6 +16,8 @@ import datetime
 import pandas as pd
 import numpy as np
 from typing import Dict, Optional, Tuple, List
+import subprocess
+import shutil
 
 # Optional S3 support
 try:
@@ -41,6 +44,11 @@ CNB_MIN_VIEWS = 50  # Filter CNB auctions below this view count
 # Output
 OUTPUT_PREFIX = "mii_results"
 S3_BUCKET = "my-mii-reports"
+
+# GitHub repository path (set to None to disable GitHub upload)
+GITHUB_REPO_PATH = "/path/to/your/mii-reports"  # CHANGE THIS to your local repo path
+# Example Mac/Linux: "/Users/yourname/GitHub/mii-reports"
+# Example Windows: "C:/Users/yourname/GitHub/mii-reports"
 
 # Instagram estimates metadata
 IG_ESTIMATES_VERSION = "2025-Q4"
@@ -78,6 +86,58 @@ def upload_to_s3(file_name: str, bucket: str, object_name: Optional[str] = None)
         return False
     except Exception as e:
         print(f"❌ Upload failed: {e}")
+        return False
+
+def upload_to_github(csv_file: str, repo_path: str, commit_message: Optional[str] = None) -> bool:
+    """
+    Push updated CSV to GitHub repository.
+    
+    Args:
+        csv_file: Path to the CSV file to upload
+        repo_path: Path to your local GitHub repo
+        commit_message: Optional custom commit message
+        
+    Returns:
+        True if upload succeeded, False otherwise
+    """
+    try:
+        # Copy CSV to GitHub repo with standardized name
+        dest_file = os.path.join(repo_path, "mii_results_latest.csv")
+        shutil.copy(csv_file, dest_file)
+        print(f"📋 Copied {csv_file} → {dest_file}")
+        
+        # Change to repo directory
+        original_dir = os.getcwd()
+        os.chdir(repo_path)
+        
+        # Git commands to commit and push
+        subprocess.run(["git", "add", "mii_results_latest.csv"], check=True)
+        
+        if commit_message is None:
+            commit_message = f"Update MII data - {datetime.datetime.now():%Y-%m-%d %H:%M}"
+        
+        subprocess.run(["git", "commit", "-m", commit_message], check=True)
+        subprocess.run(["git", "push"], check=True)
+        
+        # Return to original directory
+        os.chdir(original_dir)
+        
+        print("✅ Successfully pushed to GitHub")
+        return True
+        
+    except subprocess.CalledProcessError as e:
+        print(f"❌ Git command failed: {e}")
+        try:
+            os.chdir(original_dir)
+        except:
+            pass
+        return False
+    except Exception as e:
+        print(f"❌ GitHub push failed: {e}")
+        try:
+            os.chdir(original_dir)
+        except:
+            pass
         return False
 
 def extract_proper_model(model_text: str, make_text: Optional[str] = None) -> Optional[str]:
@@ -1153,6 +1213,7 @@ def main():
     4. Generate insights and reports
     5. Save results
     6. Upload to S3 (if configured)
+    7. Push to GitHub (if configured)
     """
     print("=" * 60)
     print("🚀 MII Calculator v2.0 (Enhanced & Robust)")
@@ -1231,8 +1292,8 @@ def main():
     tier_dist = mii[mii['quarter'] == latest_quarter]['Tier'].value_counts().sort_index()
     print(f"\n🎖️  Tier Distribution ({latest_quarter}):")
     for tier, count in tier_dist.items():
-        pct = 100 * count / tier_dist.sum()
-        print(f"  {tier}: {count:,} ({pct:.1f}%)")
+        pct_value = 100 * count / tier_dist.sum()
+        print(f"  {tier}: {count:,} ({pct_value:.1f}%)")
 
     # 5) Save results
     print("\n" + "=" * 60)
@@ -1271,6 +1332,15 @@ def main():
                 upload_to_s3(cohort_csv, S3_BUCKET)
         else:
             print("⚠️  S3 upload skipped: boto3 not installed")
+    
+    # 7) Optional GitHub upload
+    if GITHUB_REPO_PATH and os.path.exists(GITHUB_REPO_PATH):
+        print(f"\n🐙 Pushing to GitHub: {GITHUB_REPO_PATH}")
+        upload_to_github(latest_csv, GITHUB_REPO_PATH)
+    elif GITHUB_REPO_PATH and GITHUB_REPO_PATH != "/path/to/your/mii-reports":
+        print(f"⚠️  GitHub repo path not found: {GITHUB_REPO_PATH}")
+    elif GITHUB_REPO_PATH == "/path/to/your/mii-reports":
+        print(f"ℹ️  GitHub upload skipped: Update GITHUB_REPO_PATH in config")
 
     print("\n" + "=" * 60)
     print("🎉 MII CALCULATION COMPLETE")
