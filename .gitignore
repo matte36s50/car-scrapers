@@ -1,0 +1,13 @@
+# Ignore all MII output CSV files
+mii_results_*.csv
+mii_pct_change_*.csv
+mii_cohort_analysis_*.csv
+
+# Ignore BAT/CNB scraped data
+bat.csv
+cnb.csv
+bat*.csv
+cnb*.csv
+
+# Keep Python scripts
+!*.py
