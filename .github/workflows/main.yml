@@ -2,14 +2,14 @@ name: BAT and CNB Scraper Pipeline
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 6 AM UTC daily
-    - cron: '0 18 * * *'  # 6 PM UTC daily
-  workflow_dispatch:       # Allow manual trigger
+    - cron: '0 6 * * *'
+    - cron: '0 18 * * *'
+  workflow_dispatch:
 
 jobs:
   scrape-and-analyze:
     runs-on: ubuntu-22.04
-    timeout-minutes: 240   # 4 hours max
+    timeout-minutes: 240
     
     steps:
     - name: Checkout code
@@ -40,7 +40,7 @@ jobs:
         echo "=========================================="
         echo "Starting Cars & Bids scraper..."
         echo "=========================================="
-        python cnb_scraper.py || echo "⚠️ CNB scraper encountered errors"
+        python cnb_scraper.py || echo "CNB scraper encountered errors"
       continue-on-error: true
       
     - name: Upload CNB results to S3
@@ -49,7 +49,7 @@ jobs:
         if ls cnb*.csv 1> /dev/null 2>&1; then
           for file in cnb*.csv; do
             aws s3 cp "$file" s3://my-mii-reports/scraped-data/
-            echo "✓ Uploaded $file to S3"
+            echo "Uploaded $file to S3"
           done
         else
           echo "No CNB CSV files found"
@@ -66,7 +66,7 @@ jobs:
         echo "=========================================="
         echo "Starting Bring a Trailer scraper..."
         echo "=========================================="
-        python bat_scraper.py || echo "⚠️ BAT scraper encountered errors"
+        python bat_scraper.py || echo "BAT scraper encountered errors"
       continue-on-error: true
       
     - name: Upload BAT results to S3
@@ -75,7 +75,7 @@ jobs:
         if ls bat*.csv 1> /dev/null 2>&1; then
           for file in bat*.csv; do
             aws s3 cp "$file" s3://my-mii-reports/scraped-data/
-            echo "✓ Uploaded $file to S3"
+            echo "Uploaded $file to S3"
           done
         else
           echo "No BAT CSV files found"
@@ -87,7 +87,7 @@ jobs:
         echo "=========================================="
         echo "Starting MII calculations..."
         echo "=========================================="
-        python enhanced_mii_calculator.py || echo "⚠️ MII calculator encountered errors"
+        python enhanced_mii_calculator.py || echo "MII calculator encountered errors"
       continue-on-error: true
       
     - name: Upload MII reports to S3
@@ -96,18 +96,16 @@ jobs:
         if ls mii*.csv 1> /dev/null 2>&1; then
           for file in mii*.csv; do
             aws s3 cp "$file" s3://my-mii-reports/reports/
-            echo "✓ Uploaded $file to S3"
+            echo "Uploaded $file to S3"
           done
         fi
-        
         if ls *.json 1> /dev/null 2>&1; then
           for file in *.json; do
             aws s3 cp "$file" s3://my-mii-reports/reports/
-            echo "✓ Uploaded $file to S3"
+            echo "Uploaded $file to S3"
           done
         fi
-        
-        echo "✓ All MII reports uploaded to S3"
+        echo "All MII reports uploaded to S3"
       continue-on-error: true
       
     - name: Upload artifacts for debugging
@@ -120,7 +118,7 @@ jobs:
           *.txt
         retention-days: 7
         
-   - name: Summary
+    - name: Summary
       if: always()
       run: |
         echo "=========================================="
@@ -130,24 +128,3 @@ jobs:
         echo "  - scraped-data/ (CNB and BAT CSV files)"
         echo "  - reports/ (MII analysis files)"
         echo "=========================================="
-**Save this as:** `.github/workflows/main.yml`
-
-## What This Does:
-
-1. **Runs twice daily** (6 AM and 6 PM UTC)
-2. **CNB Scraper** → Immediately uploads results to S3
-3. **60-second wait** (be respectful to servers)
-4. **BAT Scraper** → Immediately uploads results to S3
-5. **MII Calculator** → Processes data and uploads analysis to S3
-6. **Never commits CSV files** to your GitHub repo
-
-## S3 Structure:
-```
-my-mii-reports/
-├── scraped-data/
-│   ├── cnb_sitemap_full_cleaned.csv
-│   └── bat_data_YYYYMMDD_HHMM.csv
-└── reports/
-    ├── mii_enhanced_with_hot_index.csv
-    ├── german_luxury_classic_summary.csv
-    └── instagram_data_all_models.csv
