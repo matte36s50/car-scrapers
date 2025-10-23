@@ -46,7 +46,7 @@ OUTPUT_PREFIX = "mii_results"
 S3_BUCKET = "my-mii-reports"
 
 # GitHub repository path (set to None to disable GitHub upload)
-GITHUB_REPO_PATH = "/path/to/your/mii-reports"  # CHANGE THIS to your local repo path
+GITHUB_REPO_PATH = "/Users/matthewlotterhand/Documents/GitHub/mii-reports"  
 # Example Mac/Linux: "/Users/yourname/GitHub/mii-reports"
 # Example Windows: "C:/Users/yourname/GitHub/mii-reports"
 
