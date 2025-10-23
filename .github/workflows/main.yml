@@ -120,7 +120,7 @@ jobs:
           *.txt
         retention-days: 7
         
-    - name: Summary
+   - name: Summary
       if: always()
       run: |
         echo "=========================================="
@@ -130,8 +130,6 @@ jobs:
         echo "  - scraped-data/ (CNB and BAT CSV files)"
         echo "  - reports/ (MII analysis files)"
         echo "=========================================="
-```
-
 **Save this as:** `.github/workflows/main.yml`
 
 ## What This Does:
