@@ -1,11 +1,9 @@
 name: BAT and CNB Scraper Pipeline
-
 on:
   schedule:
     - cron: '0 6 * * *'
     - cron: '0 18 * * *'
   workflow_dispatch:
-
 jobs:
   scrape-and-analyze:
     runs-on: ubuntu-22.04
@@ -35,6 +33,32 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
         
+    - name: Download existing data from S3
+      run: |
+        echo "=========================================="
+        echo "Downloading existing data from S3..."
+        echo "=========================================="
+        
+        # Download existing CNB data (if it exists)
+        if aws s3 ls s3://my-mii-reports/scraped-data/cnb.csv; then
+          aws s3 cp s3://my-mii-reports/scraped-data/cnb.csv cnb.csv
+          echo "✓ Downloaded cnb.csv ($(wc -l < cnb.csv) rows)"
+        else
+          echo "⚠️ No existing cnb.csv in S3 (scrapers will create new file)"
+        fi
+        
+        # Download existing BAT data (if it exists)
+        if aws s3 ls s3://my-mii-reports/scraped-data/bat.csv; then
+          aws s3 cp s3://my-mii-reports/scraped-data/bat.csv bat.csv
+          echo "✓ Downloaded bat.csv ($(wc -l < bat.csv) rows)"
+        else
+          echo "⚠️ No existing bat.csv in S3 (scrapers will create new file)"
+        fi
+        
+        echo ""
+        echo "Files ready for scrapers:"
+        ls -lh *.csv 2>/dev/null || echo "Starting fresh (no existing files)"
+        
     - name: Run CNB Scraper
       run: |
         echo "=========================================="
@@ -46,13 +70,11 @@ jobs:
     - name: Upload CNB results to S3
       if: always()
       run: |
-        if ls cnb*.csv 1> /dev/null 2>&1; then
-          for file in cnb*.csv; do
-            aws s3 cp "$file" s3://my-mii-reports/scraped-data/
-            echo "Uploaded $file to S3"
-          done
+        if [ -f cnb.csv ]; then
+          aws s3 cp cnb.csv s3://my-mii-reports/scraped-data/cnb.csv
+          echo "✓ Uploaded cnb.csv to S3 ($(wc -l < cnb.csv) rows)"
         else
-          echo "No CNB CSV files found"
+          echo "⚠️ No cnb.csv file found to upload"
         fi
       continue-on-error: true
       
@@ -72,13 +94,11 @@ jobs:
     - name: Upload BAT results to S3
       if: always()
       run: |
-        if ls bat*.csv 1> /dev/null 2>&1; then
-          for file in bat*.csv; do
-            aws s3 cp "$file" s3://my-mii-reports/scraped-data/
-            echo "Uploaded $file to S3"
-          done
+        if [ -f bat.csv ]; then
+          aws s3 cp bat.csv s3://my-mii-reports/scraped-data/bat.csv
+          echo "✓ Uploaded bat.csv to S3 ($(wc -l < bat.csv) rows)"
         else
-          echo "No BAT CSV files found"
+          echo "⚠️ No bat.csv file found to upload"
         fi
       continue-on-error: true
       
@@ -87,24 +107,47 @@ jobs:
         echo "=========================================="
         echo "Starting MII calculations..."
         echo "=========================================="
+        
+        # Show what files are available
+        echo "Files available for MII calculation:"
+        ls -lh cnb.csv bat.csv 2>/dev/null || echo "Warning: Some files may be missing"
+        
         python enhanced_mii_all_models.py || echo "MII calculator encountered errors"
       continue-on-error: true
       
     - name: Upload MII reports to S3
       if: always()
       run: |
-        if ls mii*.csv 1> /dev/null 2>&1; then
-          for file in mii*.csv; do
-            aws s3 cp "$file" s3://my-mii-reports/reports/
-            echo "Uploaded $file to S3"
-          done
+        echo "=========================================="
+        echo "Uploading MII reports to S3..."
+        echo "=========================================="
+        
+        # Upload individual auction results
+        if [ -f mii_individual_auctions.csv ]; then
+          aws s3 cp mii_individual_auctions.csv s3://my-mii-reports/reports/mii_individual_auctions.csv
+          echo "✓ Uploaded mii_individual_auctions.csv ($(wc -l < mii_individual_auctions.csv) rows)"
         fi
+        
+        # Upload model summary
+        if [ -f mii_model_summary.csv ]; then
+          aws s3 cp mii_model_summary.csv s3://my-mii-reports/reports/mii_model_summary.csv
+          echo "✓ Uploaded mii_model_summary.csv"
+        fi
+        
+        # Upload manufacturer summary
+        if [ -f mii_manufacturer_summary.csv ]; then
+          aws s3 cp mii_manufacturer_summary.csv s3://my-mii-reports/reports/mii_manufacturer_summary.csv
+          echo "✓ Uploaded mii_manufacturer_summary.csv"
+        fi
+        
+        # Upload any JSON files
         if ls *.json 1> /dev/null 2>&1; then
           for file in *.json; do
             aws s3 cp "$file" s3://my-mii-reports/reports/
-            echo "Uploaded $file to S3"
+            echo "✓ Uploaded $file"
           done
         fi
+        
         echo "All MII reports uploaded to S3"
       continue-on-error: true
       
@@ -125,6 +168,9 @@ jobs:
         echo "Pipeline completed!"
         echo "=========================================="
         echo "Check S3 bucket 'my-mii-reports' for results:"
-        echo "  - scraped-data/ (CNB and BAT CSV files)"
-        echo "  - reports/ (MII analysis files)"
+        echo "  - scraped-data/cnb.csv (CNB auction data)"
+        echo "  - scraped-data/bat.csv (BAT auction data)"
+        echo "  - reports/mii_individual_auctions.csv (Individual MII scores)"
+        echo "  - reports/mii_model_summary.csv (Model summaries)"
+        echo "  - reports/mii_manufacturer_summary.csv (Manufacturer summaries)"
         echo "=========================================="
