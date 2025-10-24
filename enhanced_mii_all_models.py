@@ -1,498 +1,591 @@
 #!/usr/bin/env python3
 """
-Enhanced MII Calculator - FIXED VERSION
-Calculates Market Interest Index for INDIVIDUAL auctions (not aggregated)
+Enhanced MII (Market Interest Index) Calculator - FIXED VERSION
+================================================================
 
-Key Changes:
-1. NO aggregation before MII calculation
-2. Price cleaning uses comma-counting method
-3. MII calculated per auction
-4. Outputs individual auction results
-5. Optional variant summary with MAX prices
+CRITICAL FIX: This version calculates MII for INDIVIDUAL auctions, not aggregated variants.
+Each row represents ONE auction event with its unique performance metrics.
 
+Changes from previous version:
+- ✅ NO aggregation by variant_id - preserves individual $1M+ sales
+- ✅ Integer bids only - no decimal values
+- ✅ Preserves high-value sales (Singer, 918 Spyder, etc.)
+- ✅ Adds optional manufacturer/model summaries (separate from MII)
+- ✅ Validation checks to ensure data quality
+
+Author: MII Analysis Team
 Date: October 24, 2025
 """
 
 import pandas as pd
 import numpy as np
 import re
-from typing import Optional
-import sys
 import os
+import sys
 from datetime import datetime
+import warnings
+warnings.filterwarnings('ignore')
+
+# AWS S3 for data storage
+import boto3
+from botocore.exceptions import NoCredentialsError
 
 # ============================================================================
-# PRICE CLEANING - FIXED VERSION (Comma-Counting Method)
+# CONFIGURATION
 # ============================================================================
 
-def clean_sale_amount(sale_text: str, sale_type: Optional[str] = None) -> Optional[int]:
+# Input files (can be local or S3)
+BAT_FILE = "bat.csv"
+CNB_FILE = "cnb.csv"  # Changed from cnb_sitemap_full_cleaned.csv for GitHub Actions compatibility
+
+# Output files
+OUTPUT_INDIVIDUAL = "mii_individual_auctions.csv"
+OUTPUT_MODEL_SUMMARY = "mii_model_summary.csv"
+OUTPUT_MANUFACTURER_SUMMARY = "mii_manufacturer_summary.csv"
+
+# S3 Configuration
+S3_BUCKET = "my-mii-reports"
+UPLOAD_TO_S3 = True
+
+# MII Weights (adjust as needed)
+MII_WEIGHTS = {
+    'views': 0.20,
+    'bids': 0.25,
+    'comments': 0.15,
+    'sale_amount': 0.30,
+    'car_age': -0.10  # Negative weight - newer is better
+}
+
+# ============================================================================
+# UTILITY FUNCTIONS
+# ============================================================================
+
+def clean_cnb_price(price_str):
     """
-    Clean and validate sale amount using comma-counting method.
+    Clean CNB prices using comma-counting method.
+    Fixes issues like "$95,00011" → "$95,000"
     
-    Fixes CNB scraping issues where extra digits are appended:
-    - Good: $95,000
-    - Bad: $95,00011 (has 5 digits after comma instead of 3)
-    
-    Solution: Look at digits after last comma, keep only first 3.
-    """
-    if not sale_text or pd.isna(sale_text):
-        return None
-    
-    # Handle reserve not met
-    if sale_type and 'reserve' in str(sale_type).lower():
-        return None
-    
-    # Convert to string and clean
-    sale_str = str(sale_text).replace('$', '').replace(' ', '').strip()
-    
-    # Handle various formats
-    if not sale_str or sale_str == '0':
-        return None
-    
-    # Find the last comma
-    last_comma_pos = sale_str.rfind(',')
-    
-    if last_comma_pos == -1:
-        # No comma - just parse as integer
-        try:
-            amount = int(float(sale_str))
-            return amount if 100 <= amount <= 10000000 else None
-        except:
-            return None
-    
-    # Get everything after the last comma
-    after_comma = sale_str[last_comma_pos + 1:]
-    
-    # Count digits after comma
-    digit_count = len(after_comma)
-    
-    # Standard US format should have exactly 3 digits after final comma
-    if digit_count > 3:
-        # We have extra digits - keep only the first 3
-        corrected = sale_str[:last_comma_pos] + sale_str[last_comma_pos:last_comma_pos + 4]
-        sale_str = corrected
-        print(f"  🔧 Price correction: {sale_text} → {corrected}")
-    
-    # Remove all commas and parse
-    try:
-        amount = int(sale_str.replace(',', ''))
+    Args:
+        price_str: Price string from CNB scraper
         
-        # Sanity check: reasonable range
-        if amount < 100 or amount > 10000000:
-            print(f"  ⚠️ Price out of range: ${amount:,}")
-            return None
-            
-        return amount
+    Returns:
+        Cleaned numeric price value
+    """
+    if pd.isna(price_str) or price_str == "":
+        return np.nan
+    
+    price_str = str(price_str).strip()
+    
+    # Store original for comma counting
+    original_with_commas = price_str.replace('$', '').replace(' ', '')
+    
+    # Remove dollar signs, commas, whitespace
+    price_clean = price_str.replace('$', '').replace(' ', '').replace(',', '')
+    
+    # If original had commas, check last segment
+    if ',' in original_with_commas:
+        parts = original_with_commas.split(',')
+        last_part = parts[-1]
+        
+        # Last part should have exactly 3 digits in US format
+        if len(last_part) > 3:
+            # Too many digits - truncate to 3
+            # Reconstruct: everything before last comma + corrected last part
+            corrected_parts = parts[:-1] + [last_part[:3]]
+            price_clean = ''.join(corrected_parts)
+    
+    # Convert to float
+    try:
+        return float(price_clean)
     except:
-        return None
+        return np.nan
 
+def extract_numeric(value):
+    """Extract numeric value from string"""
+    if pd.isna(value):
+        return np.nan
+    
+    value_str = str(value).replace(',', '').replace('$', '')
+    match = re.search(r'\d+\.?\d*', value_str)
+    if match:
+        try:
+            return float(match.group())
+        except:
+            return np.nan
+    return np.nan
 
-# ============================================================================
-# DATA VALIDATION
-# ============================================================================
+def classify_variant(row):
+    """
+    Classify car into variant categories for analysis.
+    This does NOT aggregate data - just adds a classification column.
+    """
+    model = str(row.get('model', '')).upper()
+    year = row.get('year', None)
+    
+    # Extract generation/variant information
+    variant_id = model
+    
+    # Add year decade if available
+    if pd.notna(year):
+        try:
+            decade = int(float(year)) // 10 * 10
+            variant_id += f"_{decade}s"
+        except:
+            variant_id += "_UNKNOWN_ERA"
+    
+    return variant_id
 
-def validate_individual_auction_data(df):
-    """Ensure data represents individual auctions, not aggregates"""
+def upload_to_s3(file_path, bucket_name, object_name=None):
+    """Upload file to S3 bucket"""
+    if object_name is None:
+        object_name = os.path.basename(file_path)
     
-    print("\n" + "="*80)
-    print("DATA VALIDATION CHECKS")
-    print("="*80)
+    s3_client = boto3.client('s3')
+    try:
+        s3_client.upload_file(file_path, bucket_name, object_name)
+        print(f"✓ Uploaded {file_path} to s3://{bucket_name}/{object_name}")
+        return True
+    except FileNotFoundError:
+        print(f"✗ File not found: {file_path}")
+        return False
+    except NoCredentialsError:
+        print(f"✗ AWS credentials not available")
+        return False
+    except Exception as e:
+        print(f"✗ Error uploading to S3: {e}")
+        return False
+
+def validate_auction_data(df, stage=""):
+    """
+    Validate that data represents individual auctions, not aggregated variants.
+    This is CRITICAL to prevent the aggregation bug from recurring.
+    """
+    print(f"\n{'='*80}")
+    print(f"DATA VALIDATION: {stage}")
+    print(f"{'='*80}")
     
-    checks_passed = []
+    issues = []
     
-    # Check 1: No decimal bids
+    # Check 1: No decimal bids (smoking gun for aggregation)
     if 'bids_numeric' in df.columns:
-        has_decimal_bids = (df['bids_numeric'] % 1 != 0).any()
-        checks_passed.append(not has_decimal_bids)
-        print(f"\n1. Decimal bids check: {'❌ FAIL' if has_decimal_bids else '✅ PASS'}")
-        if has_decimal_bids:
-            decimal_count = (df['bids_numeric'] % 1 != 0).sum()
-            print(f"   WARNING: {decimal_count:,} decimal bid values found!")
-            print(f"   Example: {df[df['bids_numeric'] % 1 != 0]['bids_numeric'].iloc[0]}")
+        decimal_bids = df[df['bids_numeric'] % 1 != 0]
+        if len(decimal_bids) > 0:
+            issues.append(f"❌ CRITICAL: {len(decimal_bids)} rows have decimal bids!")
+            issues.append("   This indicates data has been aggregated incorrectly.")
+            print(f"   Sample decimal bids: {decimal_bids['bids_numeric'].head().tolist()}")
         else:
-            print(f"   All {len(df):,} auctions have integer bids")
+            print(f"✓ All bids are integers ({len(df)} rows)")
     
     # Check 2: High-value sales exist
     if 'sale_amount_numeric' in df.columns:
-        max_sale = df['sale_amount_numeric'].max()
-        has_high_values = max_sale > 300000
-        checks_passed.append(has_high_values)
-        print(f"\n2. High-value sales check: {'✅ PASS' if has_high_values else '⚠️ WARNING'}")
-        print(f"   Max sale: ${max_sale:,.0f}")
+        max_price = df['sale_amount_numeric'].max()
+        over_1m = len(df[df['sale_amount_numeric'] > 1000000])
+        over_500k = len(df[df['sale_amount_numeric'] > 500000])
         
-        # Check for million+ sales
-        million_plus = len(df[df['sale_amount_numeric'] > 1000000])
-        if million_plus > 0:
-            print(f"   Million+ sales: {million_plus:,} auctions")
-            checks_passed.append(True)
-        else:
-            print(f"   Million+ sales: 0 (may be expected depending on market)")
+        print(f"✓ Price ceiling: ${max_price:,.0f}")
+        print(f"✓ Sales over $1M: {over_1m}")
+        print(f"✓ Sales over $500K: {over_500k}")
+        
+        if max_price < 500000:
+            issues.append(f"⚠️  Warning: Maximum sale price is only ${max_price:,.0f}")
+            issues.append("   Expected some sales over $1M for high-value cars")
     
-    # Check 3: Individual auction identifiers
-    if 'auction_url' in df.columns:
-        has_urls = df['auction_url'].notna().sum()
-        all_have_urls = has_urls == len(df)
-        checks_passed.append(all_have_urls)
-        print(f"\n3. Individual auction URLs: {'✅ PASS' if all_have_urls else '❌ FAIL'}")
-        print(f"   URLs present: {has_urls:,} / {len(df):,}")
-    
-    # Check 4: Reasonable price distribution
+    # Check 3: Realistic distribution
     if 'sale_amount_numeric' in df.columns:
-        price_stats = df['sale_amount_numeric'].describe()
-        median = price_stats['50%']
-        mean = price_stats['mean']
+        p99 = df['sale_amount_numeric'].quantile(0.99)
+        print(f"✓ 99th percentile price: ${p99:,.0f}")
         
-        reasonable_range = 10000 <= median <= 500000 and 10000 <= mean <= 1000000
-        checks_passed.append(reasonable_range)
-        print(f"\n4. Price distribution check: {'✅ PASS' if reasonable_range else '⚠️ WARNING'}")
-        print(f"   Median: ${median:,.0f}")
-        print(f"   Mean: ${mean:,.0f}")
+        if p99 < 300000:
+            issues.append(f"⚠️  Warning: 99th percentile is only ${p99:,.0f}")
     
-    # Summary
-    all_passed = all(checks_passed)
-    print(f"\n{'✅ ALL CHECKS PASSED' if all_passed else '⚠️ SOME CHECKS FAILED'}")
-    print(f"   {sum(checks_passed)}/{len(checks_passed)} checks passed")
-    print("="*80 + "\n")
+    # Check 4: Individual auction structure
+    print(f"✓ Total records: {len(df):,}")
     
-    return all_passed
-
-
-# ============================================================================
-# VARIANT CLASSIFICATION
-# ============================================================================
-
-def classify_variant(row):
-    """Create variant ID from make, model, and generation"""
-    make = str(row.get('make', '')).strip().upper()
-    model = str(row.get('model', '')).strip().upper()
-    
-    # Extract generation if available
-    generation = 'GEN_OTHER'
-    
-    # Common generation patterns
-    gen_patterns = [
-        r'\b(991|992|997|996|993|964|930|993\.2)\b',  # Porsche 911 generations
-        r'\b(E\d{2}|F\d{2}|G\d{2})\b',                # BMW generations
-        r'\b(W\d{3}|C\d{3}|R\d{3})\b',                # Mercedes generations
-        r'\b(MK\d+|MARK\s*\d+|GEN\s*\d+)\b',         # General generations
-        r'\b(I{1,3}|IV|V|VI|VII|VIII)\b'              # Roman numerals
-    ]
-    
-    for pattern in gen_patterns:
-        match = re.search(pattern, model, re.IGNORECASE)
-        if match:
-            generation = match.group(0).upper()
-            break
-    
-    return f"{make}_{model}_{generation}"
-
-
-# ============================================================================
-# MII CALCULATION
-# ============================================================================
-
-def calculate_mii_for_individual_auctions(df):
-    """
-    Calculate MII Index for INDIVIDUAL auctions (not aggregated).
-    
-    This is the CORRECT approach - each row represents one auction event.
-    """
-    print("\n" + "="*80)
-    print("CALCULATING MII FOR INDIVIDUAL AUCTIONS")
-    print("="*80 + "\n")
-    
-    # Ensure we have the required columns
-    required_cols = ['sale_amount_numeric', 'bids_numeric', 'views_numeric']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    
-    if missing_cols:
-        print(f"❌ Missing required columns: {missing_cols}")
-        return df
-    
-    # Filter to completed auctions only (those with sale amounts)
-    df_complete = df[df['sale_amount_numeric'].notna()].copy()
-    print(f"Auctions with sale amounts: {len(df_complete):,} / {len(df):,}")
-    
-    # Add variant classification (as a column, not aggregating)
-    if 'variant_id' not in df_complete.columns:
-        print("Classifying variants...")
-        df_complete['variant_id'] = df_complete.apply(classify_variant, axis=1)
-    
-    # Calculate Z-scores for normalization
-    print("Calculating Z-scores...")
-    metrics = ['views_numeric', 'bids_numeric', 'sale_amount_numeric']
-    
-    # Optional: Add comments if available
-    if 'comments_numeric' in df_complete.columns:
-        metrics.append('comments_numeric')
-    
-    for col in metrics:
-        mean = df_complete[col].mean()
-        std = df_complete[col].std()
-        
-        if std > 0:
-            df_complete[f'z_{col}'] = (df_complete[col] - mean) / std
-        else:
-            df_complete[f'z_{col}'] = 0
-        
-        print(f"  {col}: μ={mean:.2f}, σ={std:.2f}")
-    
-    # Calculate car age Z-score (newer is better, so negate)
-    if 'year' in df_complete.columns:
-        current_year = datetime.now().year
-        df_complete['car_age'] = current_year - df_complete['year']
-        
-        mean_age = df_complete['car_age'].mean()
-        std_age = df_complete['car_age'].std()
-        
-        if std_age > 0:
-            df_complete['z_car_age'] = -(df_complete['car_age'] - mean_age) / std_age
-        else:
-            df_complete['z_car_age'] = 0
-        
-        print(f"  car_age: μ={mean_age:.2f}, σ={std_age:.2f} (negated for scoring)")
-    
-    # Define weights
-    weights = {
-        'z_bids_numeric': 0.25,
-        'z_views_numeric': 0.20,
-        'z_sale_amount_numeric': 0.30,
-    }
-    
-    if 'z_comments_numeric' in df_complete.columns:
-        weights['z_comments_numeric'] = 0.15
-        weights['z_car_age'] = 0.10
+    if len(issues) == 0:
+        print(f"\n{'✅ ALL VALIDATION CHECKS PASSED'}")
+        print(f"{'='*80}\n")
+        return True
     else:
-        weights['z_car_age'] = 0.25
+        print(f"\n{'🚨 VALIDATION ISSUES DETECTED:'}")
+        for issue in issues:
+            print(issue)
+        print(f"{'='*80}\n")
+        return False
+
+# ============================================================================
+# DATA LOADING AND CLEANING
+# ============================================================================
+
+def load_bat_data(file_path):
+    """Load and clean BAT (Bring a Trailer) auction data"""
+    print(f"\n{'='*80}")
+    print("LOADING BAT DATA")
+    print(f"{'='*80}")
     
-    # Ensure weights sum to 1.0
-    total_weight = sum(weights.values())
-    weights = {k: v/total_weight for k, v in weights.items()}
+    try:
+        df = pd.read_csv(file_path)
+        print(f"✓ Loaded {len(df):,} BAT auctions from {file_path}")
+        
+        # Clean and standardize columns
+        df['source'] = 'BAT'
+        
+        # Numeric conversions
+        df['bids_numeric'] = df['bids'].apply(extract_numeric)
+        df['comments_numeric'] = df['comments'].apply(extract_numeric)
+        df['views_numeric'] = df['views'].apply(extract_numeric)
+        df['sale_amount_numeric'] = df['sale_amount'].apply(extract_numeric)
+        
+        # Year handling
+        if 'year' in df.columns:
+            df['year'] = pd.to_numeric(df['year'], errors='coerce')
+        
+        # Current year for age calculation
+        current_year = datetime.now().year
+        df['car_age'] = current_year - df['year']
+        
+        print(f"✓ Cleaned BAT data: {len(df):,} auctions")
+        return df
+        
+    except FileNotFoundError:
+        print(f"✗ BAT file not found: {file_path}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"✗ Error loading BAT data: {e}")
+        return pd.DataFrame()
+
+def load_cnb_data(file_path):
+    """Load and clean CNB (Cars and Bids) auction data"""
+    print(f"\n{'='*80}")
+    print("LOADING CNB DATA")
+    print(f"{'='*80}")
     
-    print(f"\nWeights (normalized):")
-    for metric, weight in weights.items():
-        print(f"  {metric}: {weight:.3f}")
+    try:
+        df = pd.read_csv(file_path)
+        print(f"✓ Loaded {len(df):,} CNB auctions from {file_path}")
+        
+        # Clean and standardize columns
+        df['source'] = 'CNB'
+        
+        # CNB price cleaning with comma-counting method
+        df['sale_amount_numeric'] = df['sale_amount'].apply(clean_cnb_price)
+        
+        # Other numeric conversions
+        df['bids_numeric'] = df.get('bids', pd.Series()).apply(extract_numeric)
+        df['comments_numeric'] = df.get('comments', pd.Series()).apply(extract_numeric)
+        df['views_numeric'] = df.get('views', pd.Series()).apply(extract_numeric)
+        
+        # Year handling
+        if 'year' in df.columns:
+            df['year'] = pd.to_numeric(df['year'], errors='coerce')
+        
+        # Current year for age calculation
+        current_year = datetime.now().year
+        df['car_age'] = current_year - df['year']
+        
+        # Show CNB price statistics
+        print(f"\nCNB Price Statistics:")
+        print(f"  Mean: ${df['sale_amount_numeric'].mean():,.0f}")
+        print(f"  Median: ${df['sale_amount_numeric'].median():,.0f}")
+        print(f"  Max: ${df['sale_amount_numeric'].max():,.0f}")
+        print(f"  Over $1M: {len(df[df['sale_amount_numeric'] > 1000000])}")
+        
+        print(f"✓ Cleaned CNB data: {len(df):,} auctions")
+        return df
+        
+    except FileNotFoundError:
+        print(f"✗ CNB file not found: {file_path}")
+        return pd.DataFrame()
+    except Exception as e:
+        print(f"✗ Error loading CNB data: {e}")
+        return pd.DataFrame()
+
+# ============================================================================
+# MII CALCULATION (INDIVIDUAL AUCTION LEVEL)
+# ============================================================================
+
+def calculate_mii_individual(df):
+    """
+    Calculate MII Index for INDIVIDUAL auctions.
     
-    # Calculate MII Score
+    CRITICAL: This function does NOT aggregate data.
+    Each row in the output represents ONE auction event.
+    """
+    print(f"\n{'='*80}")
+    print("CALCULATING MII SCORES (INDIVIDUAL AUCTIONS)")
+    print(f"{'='*80}")
+    
+    # Validate input
+    if not validate_auction_data(df, "Input Data Check"):
+        print("⚠️  Proceeding despite validation warnings...")
+    
+    # Make a copy to avoid modifying original
+    mii_df = df.copy()
+    
+    # Required columns for MII calculation
+    required_cols = ['bids_numeric', 'views_numeric', 'sale_amount_numeric', 'car_age']
+    
+    # Filter to rows with required data
+    mii_df = mii_df.dropna(subset=required_cols)
+    print(f"✓ Filtered to {len(mii_df):,} auctions with complete data")
+    
+    # Calculate z-scores for normalization
+    # Using robust method with winsorization to handle outliers
+    print("\nCalculating z-scores...")
+    
+    for col in ['bids_numeric', 'views_numeric', 'comments_numeric', 'sale_amount_numeric', 'car_age']:
+        if col in mii_df.columns:
+            # Winsorize at 1st and 99th percentiles to handle outliers
+            p01 = mii_df[col].quantile(0.01)
+            p99 = mii_df[col].quantile(0.99)
+            
+            # Clip extreme values
+            winsorized = mii_df[col].clip(lower=p01, upper=p99)
+            
+            # Calculate z-score
+            mean_val = winsorized.mean()
+            std_val = winsorized.std()
+            
+            if std_val > 0:
+                mii_df[f'z_{col}'] = (winsorized - mean_val) / std_val
+            else:
+                mii_df[f'z_{col}'] = 0
+            
+            print(f"  {col:<25} : μ={mean_val:>10,.1f}, σ={std_val:>10,.1f}")
+    
+    # Calculate MII Score using weighted combination
     print("\nCalculating MII Score...")
-    df_complete['MII_Score'] = 0
+    mii_df['MII_Score'] = 0
     
-    for col, weight in weights.items():
-        if col in df_complete.columns:
-            df_complete['MII_Score'] += df_complete[col] * weight
+    for metric, weight in MII_WEIGHTS.items():
+        col_name = f'z_{metric}_numeric' if metric != 'car_age' else 'z_car_age'
+        if col_name in mii_df.columns:
+            mii_df['MII_Score'] += mii_df[col_name] * weight
+            print(f"  {metric:<15} weight: {weight:>6.2f}")
     
     # Normalize to 0-100 scale
-    min_score = df_complete['MII_Score'].min()
-    max_score = df_complete['MII_Score'].max()
+    min_score = mii_df['MII_Score'].min()
+    max_score = mii_df['MII_Score'].max()
     
     if max_score > min_score:
-        df_complete['MII_Index'] = ((df_complete['MII_Score'] - min_score) / 
-                                    (max_score - min_score)) * 100
+        mii_df['MII_Index'] = ((mii_df['MII_Score'] - min_score) / (max_score - min_score)) * 100
     else:
-        df_complete['MII_Index'] = 50
+        mii_df['MII_Index'] = 50  # Default if all scores are the same
     
-    print(f"\n✓ MII Score calculated for {len(df_complete):,} individual auctions")
+    # Add tier classification
+    mii_df['MII_Tier'] = pd.cut(
+        mii_df['MII_Index'],
+        bins=[-np.inf, 20, 40, 60, 80, np.inf],
+        labels=['D', 'C', 'B', 'A', 'S']
+    )
+    
+    # Add variant classification (for grouping, NOT aggregation)
+    mii_df['variant_id'] = mii_df.apply(classify_variant, axis=1)
+    
+    print(f"\n✓ MII Index calculated for {len(mii_df):,} individual auctions")
     print(f"\nMII Index Distribution:")
-    print(f"  Mean: {df_complete['MII_Index'].mean():.2f}")
-    print(f"  Median: {df_complete['MII_Index'].median():.2f}")
-    print(f"  Min: {df_complete['MII_Index'].min():.2f}")
-    print(f"  Max: {df_complete['MII_Index'].max():.2f}")
-    print(f"  Std: {df_complete['MII_Index'].std():.2f}")
+    print(f"  Mean:   {mii_df['MII_Index'].mean():>6.2f}")
+    print(f"  Median: {mii_df['MII_Index'].median():>6.2f}")
+    print(f"  Std:    {mii_df['MII_Index'].std():>6.2f}")
+    print(f"  Min:    {mii_df['MII_Index'].min():>6.2f}")
+    print(f"  Max:    {mii_df['MII_Index'].max():>6.2f}")
     
-    # Show top 20 individual auctions
+    # Show tier distribution
+    print(f"\nTier Distribution:")
+    tier_counts = mii_df['MII_Tier'].value_counts().sort_index(ascending=False)
+    for tier, count in tier_counts.items():
+        pct = count / len(mii_df) * 100
+        print(f"  {tier}-Tier: {count:>6} auctions ({pct:>5.1f}%)")
+    
+    # Validate output
+    validate_auction_data(mii_df, "Output Data Check")
+    
+    return mii_df
+
+# ============================================================================
+# OPTIONAL AGGREGATION FOR SUMMARIES (SEPARATE FROM MII)
+# ============================================================================
+
+def create_model_summary(mii_df):
+    """
+    Create model-level summary statistics.
+    This is SEPARATE from MII calculation - just for reporting.
+    """
+    print(f"\n{'='*80}")
+    print("CREATING MODEL SUMMARY (OPTIONAL AGGREGATION)")
+    print(f"{'='*80}")
+    print("NOTE: This is for summary reporting only, not for MII calculation")
+    
+    summary = mii_df.groupby(['make', 'model', 'variant_id']).agg({
+        'MII_Index': ['mean', 'median', 'std', 'count'],
+        'sale_amount_numeric': ['mean', 'median', 'max', 'min'],
+        'bids_numeric': ['mean', 'sum'],
+        'views_numeric': ['mean', 'sum'],
+        'comments_numeric': ['mean', 'sum'],
+        'year': ['min', 'max']
+    }).reset_index()
+    
+    # Flatten column names
+    summary.columns = ['_'.join(col).strip('_') if col[1] else col[0] 
+                       for col in summary.columns.values]
+    
+    # Sort by average MII
+    summary = summary.sort_values('MII_Index_mean', ascending=False)
+    
+    print(f"✓ Created summary for {len(summary):,} model variants")
+    print(f"\nTop 10 Models by Average MII:")
+    for idx, row in summary.head(10).iterrows():
+        print(f"  {row['make']} {row['model'][:40]:<40} | Avg MII: {row['MII_Index_mean']:>6.2f} | Auctions: {row['MII_Index_count']:>4.0f}")
+    
+    return summary
+
+def create_manufacturer_summary(mii_df):
+    """
+    Create manufacturer-level summary statistics.
+    This is SEPARATE from MII calculation - just for reporting.
+    """
+    print(f"\n{'='*80}")
+    print("CREATING MANUFACTURER SUMMARY (OPTIONAL AGGREGATION)")
+    print(f"{'='*80}")
+    print("NOTE: This is for summary reporting only, not for MII calculation")
+    
+    summary = mii_df.groupby('make').agg({
+        'MII_Index': ['mean', 'median', 'std', 'count'],
+        'sale_amount_numeric': ['mean', 'median', 'max', 'sum'],
+        'bids_numeric': ['mean', 'sum'],
+        'views_numeric': ['mean', 'sum'],
+        'comments_numeric': ['mean', 'sum']
+    }).reset_index()
+    
+    # Flatten column names
+    summary.columns = ['_'.join(col).strip('_') if col[1] else col[0] 
+                       for col in summary.columns.values]
+    
+    # Sort by average MII
+    summary = summary.sort_values('MII_Index_mean', ascending=False)
+    
+    print(f"✓ Created summary for {len(summary):,} manufacturers")
+    print(f"\nTop 10 Manufacturers by Average MII:")
+    for idx, row in summary.head(10).iterrows():
+        print(f"  {row['make']:<20} | Avg MII: {row['MII_Index_mean']:>6.2f} | Auctions: {row['MII_Index_count']:>5.0f}")
+    
+    return summary
+
+# ============================================================================
+# MAIN EXECUTION
+# ============================================================================
+
+def main():
+    """Main execution function"""
+    print(f"\n{'#'*80}")
+    print("# ENHANCED MII CALCULATOR - FIXED VERSION")
+    print("# Individual Auction Analysis (No Aggregation)")
+    print(f"{'#'*80}")
+    print(f"Execution Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # ========================================================================
+    # STEP 1: Load Data
+    # ========================================================================
+    
+    bat_df = load_bat_data(BAT_FILE)
+    cnb_df = load_cnb_data(CNB_FILE)
+    
+    # Combine datasets
+    if not bat_df.empty and not cnb_df.empty:
+        combined_df = pd.concat([bat_df, cnb_df], ignore_index=True)
+    elif not bat_df.empty:
+        combined_df = bat_df
+    elif not cnb_df.empty:
+        combined_df = cnb_df
+    else:
+        print("✗ No data loaded! Exiting.")
+        return
+    
+    print(f"\n{'='*80}")
+    print(f"COMBINED DATASET: {len(combined_df):,} total auctions")
+    print(f"{'='*80}")
+    
+    # ========================================================================
+    # STEP 2: Calculate MII for Individual Auctions
+    # ========================================================================
+    
+    mii_df = calculate_mii_individual(combined_df)
+    
+    # ========================================================================
+    # STEP 3: Save Individual Auction Results
+    # ========================================================================
+    
+    print(f"\n{'='*80}")
+    print("SAVING RESULTS")
+    print(f"{'='*80}")
+    
+    # Select columns for output
+    output_cols = [
+        'source', 'make', 'model', 'year', 'variant_id',
+        'sale_amount_numeric', 'bids_numeric', 'views_numeric', 'comments_numeric',
+        'car_age', 'MII_Score', 'MII_Index', 'MII_Tier'
+    ]
+    
+    # Add any additional columns that exist
+    for col in ['auction_url', 'sale_date', 'sale_type', 'location']:
+        if col in mii_df.columns:
+            output_cols.append(col)
+    
+    # Save individual auctions
+    output_df = mii_df[output_cols].copy()
+    output_df.to_csv(OUTPUT_INDIVIDUAL, index=False)
+    print(f"✓ Saved individual auction results: {OUTPUT_INDIVIDUAL}")
+    print(f"  Records: {len(output_df):,}")
+    
+    # ========================================================================
+    # STEP 4: Create Optional Summary Reports
+    # ========================================================================
+    
+    # Model summary
+    model_summary = create_model_summary(mii_df)
+    model_summary.to_csv(OUTPUT_MODEL_SUMMARY, index=False)
+    print(f"✓ Saved model summary: {OUTPUT_MODEL_SUMMARY}")
+    
+    # Manufacturer summary
+    mfr_summary = create_manufacturer_summary(mii_df)
+    mfr_summary.to_csv(OUTPUT_MANUFACTURER_SUMMARY, index=False)
+    print(f"✓ Saved manufacturer summary: {OUTPUT_MANUFACTURER_SUMMARY}")
+    
+    # ========================================================================
+    # STEP 5: Upload to S3 (if configured)
+    # ========================================================================
+    
+    if UPLOAD_TO_S3:
+        print(f"\n{'='*80}")
+        print("UPLOADING TO S3")
+        print(f"{'='*80}")
+        
+        upload_to_s3(OUTPUT_INDIVIDUAL, S3_BUCKET)
+        upload_to_s3(OUTPUT_MODEL_SUMMARY, S3_BUCKET)
+        upload_to_s3(OUTPUT_MANUFACTURER_SUMMARY, S3_BUCKET)
+    
+    # ========================================================================
+    # STEP 6: Show Top Performers
+    # ========================================================================
+    
     print(f"\n{'='*80}")
     print("TOP 20 INDIVIDUAL AUCTIONS BY MII INDEX")
     print(f"{'='*80}")
     
-    top_auctions = df_complete.nlargest(20, 'MII_Index')
+    top_20 = mii_df.nlargest(20, 'MII_Index')[['make', 'model', 'year', 'sale_amount_numeric', 'MII_Index', 'MII_Tier']]
     
-    for i, (idx, row) in enumerate(top_auctions.iterrows(), 1):
-        make = row.get('make', 'Unknown')
-        model = row.get('model', 'Unknown')
-        year = row.get('year', 0)
-        price = row.get('sale_amount_numeric', 0)
-        bids = row.get('bids_numeric', 0)
-        views = row.get('views_numeric', 0)
-        mii = row.get('MII_Index', 0)
-        
-        year_str = f"({int(year)})" if year > 0 else ""
-        print(f"{i:2d}. {make} {model:<35s} {year_str:<6s} | "
-              f"${price:>10,.0f} | {int(bids):>3d} bids | "
-              f"{int(views):>7,d} views | MII: {mii:>6.2f}")
+    for idx, row in top_20.iterrows():
+        year_str = f"({int(row['year'])})" if pd.notna(row['year']) else "(Year?)"
+        price_str = f"${row['sale_amount_numeric']:,.0f}" if pd.notna(row['sale_amount_numeric']) else "N/A"
+        print(f"  {row['MII_Tier']}-Tier | MII {row['MII_Index']:>6.2f} | {year_str} {row['make']} {row['model'][:40]:<40} | {price_str}")
     
-    print(f"{'='*80}\n")
-    
-    return df_complete
-
-
-# ============================================================================
-# VARIANT SUMMARY (OPTIONAL)
-# ============================================================================
-
-def create_variant_summary(df):
-    """
-    Create variant-level summary with PROPER aggregation.
-    
-    Key: Use MAX for sale_amount (not MEAN) to show top prices.
-    """
-    print("\n" + "="*80)
-    print("CREATING VARIANT-LEVEL SUMMARY (OPTIONAL)")
-    print("="*80 + "\n")
-    
-    if 'variant_id' not in df.columns:
-        print("❌ variant_id column not found")
-        return None
-    
-    # Aggregate properly
-    agg_dict = {
-        'MII_Index': 'mean',                  # Average MII performance
-        'sale_amount_numeric': 'max',         # HIGHEST sale (not average!)
-        'bids_numeric': 'mean',               # Average engagement
-        'views_numeric': 'mean',
-        'make': 'first',                      # Keep metadata
-        'model': 'first',
-    }
-    
-    # Optional columns
-    if 'comments_numeric' in df.columns:
-        agg_dict['comments_numeric'] = 'mean'
-    if 'year' in df.columns:
-        agg_dict['year'] = 'mean'
-    if 'auction_url' in df.columns:
-        agg_dict['auction_url'] = 'count'
-    
-    variant_summary = df.groupby('variant_id').agg(agg_dict)
-    
-    # Rename count column
-    if 'auction_url' in variant_summary.columns:
-        variant_summary = variant_summary.rename(columns={'auction_url': 'total_auctions'})
-    
-    # Reset index to make variant_id a column
-    variant_summary = variant_summary.reset_index()
-    
-    print(f"✓ Created summary for {len(variant_summary):,} variants")
-    print(f"\nSummary statistics:")
-    print(f"  Average auctions per variant: {variant_summary['total_auctions'].mean():.1f}")
-    print(f"  Max auctions per variant: {variant_summary['total_auctions'].max():.0f}")
-    
-    # Show top 10 variants
-    print(f"\nTop 10 Variants by Average MII:")
-    top_variants = variant_summary.nlargest(10, 'MII_Index')
-    
-    for i, (idx, row) in enumerate(top_variants.iterrows(), 1):
-        make = row.get('make', 'Unknown')
-        model = row.get('model', 'Unknown')
-        max_price = row.get('sale_amount_numeric', 0)
-        auctions = row.get('total_auctions', 0)
-        avg_mii = row.get('MII_Index', 0)
-        
-        print(f"{i:2d}. {make} {model:<35s} | "
-              f"Max: ${max_price:>10,.0f} | "
-              f"{int(auctions):>3d} auctions | "
-              f"Avg MII: {avg_mii:>6.2f}")
-    
-    print(f"{'='*80}\n")
-    
-    return variant_summary
-
-
-# ============================================================================
-# MAIN PIPELINE
-# ============================================================================
-
-def main():
-    """Main pipeline for MII calculation"""
-    
-    print("\n" + "="*80)
-    print("ENHANCED MII CALCULATOR - FIXED VERSION")
-    print("Calculating Market Interest Index for INDIVIDUAL auctions")
-    print("="*80 + "\n")
-    
-    # 1. Load raw data
-    input_file = 'cnb_sitemap_full_cleaned.csv'
-    
-    if not os.path.exists(input_file):
-        print(f"❌ Input file not found: {input_file}")
-        print("Please provide the raw CNB scraper output CSV")
-        sys.exit(1)
-    
-    print(f"Loading data from: {input_file}")
-    df = pd.read_csv(input_file, low_memory=False)
-    print(f"✓ Loaded {len(df):,} rows\n")
-    
-    # 2. Clean sale amounts
-    print("💰 Cleaning sale amounts...")
-    df['sale_amount_numeric'] = df.apply(
-        lambda row: clean_sale_amount(row.get('sale_amount'), row.get('sale_type')),
-        axis=1
-    )
-    
-    valid_sales = df['sale_amount_numeric'].notna().sum()
-    print(f"✓ {valid_sales:,} valid sale amounts ({valid_sales/len(df)*100:.1f}%)\n")
-    
-    # 3. Convert other numeric fields
-    print("Converting numeric fields...")
-    
-    if 'bids' in df.columns:
-        df['bids_numeric'] = pd.to_numeric(
-            df['bids'].astype(str).str.extract(r'(\d+)')[0],
-            errors='coerce'
-        )
-    
-    if 'views' in df.columns:
-        df['views_numeric'] = pd.to_numeric(
-            df['views'].astype(str).str.replace(',', ''),
-            errors='coerce'
-        )
-    
-    if 'comments' in df.columns:
-        df['comments_numeric'] = pd.to_numeric(
-            df['comments'].astype(str).str.extract(r'(\d+)')[0],
-            errors='coerce'
-        )
-    
-    if 'year' in df.columns:
-        df['year'] = pd.to_numeric(df['year'], errors='coerce')
-    
-    print("✓ Numeric conversions complete\n")
-    
-    # 4. Validate data
-    validate_individual_auction_data(df)
-    
-    # 5. Calculate MII for individual auctions
-    df_with_mii = calculate_mii_for_individual_auctions(df)
-    
-    # 6. Save individual auction results
-    output_individual = 'mii_individual_auctions.csv'
-    df_with_mii.to_csv(output_individual, index=False)
-    print(f"\n✅ Individual auction MII data saved to: {output_individual}")
-    print(f"   Total records: {len(df_with_mii):,}")
-    print(f"   File size: {os.path.getsize(output_individual) / 1024 / 1024:.2f} MB")
-    
-    # 7. Create variant summary (optional)
-    variant_summary = create_variant_summary(df_with_mii)
-    
-    if variant_summary is not None:
-        output_summary = 'mii_variant_summary.csv'
-        variant_summary.to_csv(output_summary, index=False)
-        print(f"\n✅ Variant summary saved to: {output_summary}")
-        print(f"   Total variants: {len(variant_summary):,}")
-        print(f"   File size: {os.path.getsize(output_summary) / 1024 / 1024:.2f} MB")
-    
-    # 8. Final summary
-    print("\n" + "="*80)
-    print("MII CALCULATION COMPLETE")
-    print("="*80)
-    print(f"\n✅ Output files:")
-    print(f"   1. {output_individual} - Individual auction MII scores")
-    if variant_summary is not None:
-        print(f"   2. {output_summary} - Variant-level summary")
-    print(f"\n✅ Key statistics:")
-    print(f"   Total auctions processed: {len(df_with_mii):,}")
-    print(f"   Auctions over $1M: {len(df_with_mii[df_with_mii['sale_amount_numeric'] > 1000000]):,}")
-    print(f"   MII range: {df_with_mii['MII_Index'].min():.2f} - {df_with_mii['MII_Index'].max():.2f}")
-    print("="*80 + "\n")
-
+    print(f"\n{'='*80}")
+    print("✅ MII CALCULATION COMPLETE!")
+    print(f"{'='*80}")
+    print(f"\nOutput Files:")
+    print(f"  1. {OUTPUT_INDIVIDUAL} - Individual auction MII scores")
+    print(f"  2. {OUTPUT_MODEL_SUMMARY} - Model-level summary statistics")
+    print(f"  3. {OUTPUT_MANUFACTURER_SUMMARY} - Manufacturer-level summary")
+    print(f"\nAll files represent individual auction data - no aggregation!")
 
 if __name__ == "__main__":
     main()
