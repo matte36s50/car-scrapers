@@ -939,6 +939,7 @@ def main():
         print(top_momentum[momentum_cols].to_string(index=False))
 
     # Percentage change analysis
+    pct = pd.DataFrame()  # Initialize as empty DataFrame
     if '2025Q2' in mii['quarter'].values and '2025Q3' in mii['quarter'].values:
         pct = percent_change_table(mii, clean, from_quarter='2025Q2', to_quarter='2025Q3')
         
@@ -966,8 +967,8 @@ def main():
     tier_dist = mii[mii['quarter'] == latest_quarter]['Tier'].value_counts().sort_index()
     print(f"\n🎖️  Tier Distribution ({latest_quarter}):")
     for tier, count in tier_dist.items():
-        pct = 100 * count / tier_dist.sum()
-        print(f"  {tier}: {count:,} ({pct:.1f}%)")
+        pct_val = 100 * count / tier_dist.sum()
+        print(f"  {tier}: {count:,} ({pct_val:.1f}%)")
 
     # 5) Save results
     print("\n" + "=" * 60)
@@ -983,12 +984,14 @@ def main():
     print(f"✅ Saved: {out_csv}")
     print(f"✅ Saved: {latest_csv}")
 
-    if not pct.empty:
+    # Save percentage change results if they exist
+    if isinstance(pct, pd.DataFrame) and not pct.empty:
         pct_csv = f"mii_pct_change_{ts}.csv"
         pct.to_csv(pct_csv, index=False)
         print(f"✅ Saved: {pct_csv}")
 
-    if not cohort_stats.empty:
+    # Save cohort analysis if it exists
+    if isinstance(cohort_stats, pd.DataFrame) and not cohort_stats.empty:
         cohort_csv = f"mii_cohort_analysis_{ts}.csv"
         cohort_stats.to_csv(cohort_csv, index=False)
         print(f"✅ Saved: {cohort_csv}")
@@ -999,9 +1002,9 @@ def main():
         if HAS_BOTO:
             upload_to_s3(out_csv, S3_BUCKET)
             upload_to_s3(latest_csv, S3_BUCKET)
-            if not pct.empty:
+            if isinstance(pct, pd.DataFrame) and not pct.empty:
                 upload_to_s3(pct_csv, S3_BUCKET)
-            if not cohort_stats.empty:
+            if isinstance(cohort_stats, pd.DataFrame) and not cohort_stats.empty:
                 upload_to_s3(cohort_csv, S3_BUCKET)
         else:
             print("⚠️  S3 upload skipped: boto3 not installed")
