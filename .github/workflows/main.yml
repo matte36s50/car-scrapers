@@ -113,6 +113,12 @@ jobs:
         ls -lh cnb.csv bat.csv 2>/dev/null || echo "Warning: Some files may be missing"
         
         python enhanced_mii_all_models.py || echo "MII calculator encountered errors"
+        
+        # Create mii_results_latest.csv for backward compatibility with website
+        if [ -f mii_individual_auctions.csv ]; then
+          cp mii_individual_auctions.csv mii_results_latest.csv
+          echo "✓ Created mii_results_latest.csv (copy of individual auctions)"
+        fi
       continue-on-error: true
       
     - name: Upload MII reports to S3
@@ -121,6 +127,12 @@ jobs:
         echo "=========================================="
         echo "Uploading MII reports to S3..."
         echo "=========================================="
+        
+        # Upload latest results (for website compatibility)
+        if [ -f mii_results_latest.csv ]; then
+          aws s3 cp mii_results_latest.csv s3://my-mii-reports/reports/mii_results_latest.csv
+          echo "✓ Uploaded mii_results_latest.csv ($(wc -l < mii_results_latest.csv) rows)"
+        fi
         
         # Upload individual auction results
         if [ -f mii_individual_auctions.csv ]; then
