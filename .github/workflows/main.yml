@@ -40,16 +40,16 @@ jobs:
         echo "=========================================="
         
         # Download existing CNB data (if it exists)
-        if aws s3 ls s3://my-mii-reports/scraped-data/cnb.csv; then
-          aws s3 cp s3://my-mii-reports/scraped-data/cnb.csv cnb.csv
+        if aws s3 ls s3://my-mii-reports/cnb.csv; then
+          aws s3 cp s3://my-mii-reports/cnb.csv cnb.csv
           echo "✓ Downloaded cnb.csv ($(wc -l < cnb.csv) rows)"
         else
           echo "⚠️ No existing cnb.csv in S3 (scrapers will create new file)"
         fi
         
         # Download existing BAT data (if it exists)
-        if aws s3 ls s3://my-mii-reports/scraped-data/bat.csv; then
-          aws s3 cp s3://my-mii-reports/scraped-data/bat.csv bat.csv
+        if aws s3 ls s3://my-mii-reports/bat.csv; then
+          aws s3 cp s3://my-mii-reports/bat.csv bat.csv
           echo "✓ Downloaded bat.csv ($(wc -l < bat.csv) rows)"
         else
           echo "⚠️ No existing bat.csv in S3 (scrapers will create new file)"
@@ -71,7 +71,7 @@ jobs:
       if: always()
       run: |
         if [ -f cnb.csv ]; then
-          aws s3 cp cnb.csv s3://my-mii-reports/scraped-data/cnb.csv
+          aws s3 cp cnb.csv s3://my-mii-reports/cnb.csv
           echo "✓ Uploaded cnb.csv to S3 ($(wc -l < cnb.csv) rows)"
         else
           echo "⚠️ No cnb.csv file found to upload"
@@ -95,7 +95,7 @@ jobs:
       if: always()
       run: |
         if [ -f bat.csv ]; then
-          aws s3 cp bat.csv s3://my-mii-reports/scraped-data/bat.csv
+          aws s3 cp bat.csv s3://my-mii-reports/bat.csv
           echo "✓ Uploaded bat.csv to S3 ($(wc -l < bat.csv) rows)"
         else
           echo "⚠️ No bat.csv file found to upload"
@@ -168,8 +168,8 @@ jobs:
         echo "Pipeline completed!"
         echo "=========================================="
         echo "Check S3 bucket 'my-mii-reports' for results:"
-        echo "  - scraped-data/cnb.csv (CNB auction data)"
-        echo "  - scraped-data/bat.csv (BAT auction data)"
+        echo "  - cnb.csv (CNB auction data)"
+        echo "  - bat.csv (BAT auction data)"
         echo "  - reports/mii_individual_auctions.csv (Individual MII scores)"
         echo "  - reports/mii_model_summary.csv (Model summaries)"
         echo "  - reports/mii_manufacturer_summary.csv (Manufacturer summaries)"
