@@ -87,7 +87,7 @@ jobs:
         echo "=========================================="
         echo "Starting MII calculations..."
         echo "=========================================="
-        python enhanced_mii_calculator.py || echo "MII calculator encountered errors"
+        python enhanced_mii_all_models.py || echo "MII calculator encountered errors"
       continue-on-error: true
       
     - name: Upload MII reports to S3
