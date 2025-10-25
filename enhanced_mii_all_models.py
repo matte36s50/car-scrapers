@@ -178,7 +178,9 @@ def load_scraped_data():
         if 'sale_date' in df.columns:
             df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
         elif 'end_date' in df.columns:
-            df['date'] = pd.to_datetime(df['end_date'], errors='coerce')
+            # BAT's end_date is text like "Monday, May 19 at 5:47pm" - not parseable
+            # Use sale_date instead
+            df['date'] = pd.to_datetime(df.get('sale_date', None), errors='coerce')
         
         all_data.append(df)
         print(f"  ✅ Loaded {len(df)} BAT records")
@@ -272,14 +274,33 @@ def clean_and_process_data(df):
         # Add decade
         df['decade'] = (df['year'] // 10) * 10
     
-    # Parse dates and create quarters
+    # Parse dates and create quarters with smart fallback
+    current_quarter = pd.Period(datetime.datetime.now(), freq='Q')
+    current_quarter_str = str(current_quarter)
+    current_year = datetime.datetime.now().year
+    
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        
+        # Filter out bad years (e.g., 2069)
+        if df['date'].notna().any():
+            bad_years = df['date'].dt.year > current_year + 10
+            bad_year_count = bad_years.sum()
+            if bad_year_count > 0:
+                print(f"   ⚠️  Filtered out {bad_year_count} records with invalid future years")
+                df = df[~bad_years]
+        
         df['quarter'] = df['date'].dt.to_period('Q').astype(str)
+        
+        # Replace NaT quarters with current quarter (these are recent auctions without dates)
+        nat_mask = (df['quarter'] == 'NaT') | df['quarter'].isna()
+        nat_count = nat_mask.sum()
+        if nat_count > 0:
+            print(f"   ℹ️  Assigned {nat_count} auctions without dates to {current_quarter_str}")
+            df.loc[nat_mask, 'quarter'] = current_quarter_str
     else:
-        # Default to current quarter
-        current_quarter = pd.Period(datetime.datetime.now(), freq='Q')
-        df['quarter'] = str(current_quarter)
+        # Default all to current quarter
+        df['quarter'] = current_quarter_str
     
     # Remove rows with missing critical data
     df = df.dropna(subset=['model', 'manufacturer'])
@@ -298,6 +319,13 @@ def clean_and_process_data(df):
     if 'price' in df.columns:
         print(f"   Average price: ${df['price'].mean():,.0f}")
         print(f"   Median price: ${df['price'].median():,.0f}")
+    
+    # Show quarter distribution
+    print(f"\n📅 Quarter Distribution:")
+    quarter_dist = df['quarter'].value_counts().sort_index(ascending=False)
+    for quarter, count in quarter_dist.head(8).items():
+        pct = (count / len(df)) * 100
+        print(f"   {quarter}: {count:>6,} auctions ({pct:>5.1f}%)")
     
     return df
 
