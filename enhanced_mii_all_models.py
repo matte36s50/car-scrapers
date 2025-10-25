@@ -23,6 +23,53 @@ def upload_to_s3(file_name, bucket, object_name=None):
         print(f"❌ Upload failed: {e}")
         return False
 
+def extract_numeric(value):
+    """Extract numeric value from string like 'USD $38,250' or '11,735 views'"""
+    if pd.isna(value):
+        return 0
+    
+    # Convert to string
+    value_str = str(value)
+    
+    # Remove currency symbols, commas, and text
+    # Extract all digits
+    digits = re.sub(r'[^\d]', '', value_str)
+    
+    if digits:
+        return float(digits)
+    return 0
+
+def extract_price(value):
+    """Extract price from sale_amount string like 'USD $38,250' or '$13,0009'"""
+    if pd.isna(value):
+        return None
+    
+    # Convert to string
+    value_str = str(value)
+    
+    # Check if this is USD format (BAT) or $ format (CNB)
+    is_usd_format = 'USD' in value_str
+    
+    # Extract numbers and commas
+    # Pattern: find currency amount like $38,250 or 38250
+    match = re.search(r'\$?([\d,]+)', value_str)
+    
+    if match:
+        # Remove commas and convert to float
+        amount_str = match.group(1).replace(',', '')
+        try:
+            amount = float(amount_str)
+            
+            # Handle CNB's weird format where they append bid count (e.g., $13,0009 = $13,000 + 9 bids)
+            # Only apply to non-USD format (CNB data) and amounts > 10,000
+            if not is_usd_format and amount > 10000:
+                amount = amount // 10
+            
+            return amount
+        except:
+            return None
+    return None
+
 def get_instagram_estimates(all_models):
     """Generate Instagram estimates for models"""
     known_estimates = {
@@ -92,18 +139,29 @@ def load_scraped_data():
         df = pd.read_csv('temp_bat.csv')
         df['data_source'] = 'BAT'
         
-        # Standardize column names
-        column_mapping = {
-            'listing_title': 'model',
-            'final_bid': 'price',
-            'bid_count': 'bids',
-            'comment_count': 'comments',
-            'view_count': 'views',
-            'sold_status': 'sold',
-            'listing_date': 'date',
-            'make': 'make'
-        }
-        df = df.rename(columns=column_mapping)
+        print(f"   📋 Raw BAT data: {len(df)} records")
+        
+        # Your actual BAT columns: auction_url, bids, category, comments, end_date, end_timestamp, 
+        # era, location, make, model, origin, partner, sale_amount, sale_date, sale_type, 
+        # seller_type, views, watchers, year
+        
+        # Extract price from sale_amount (e.g., "USD $38,250")
+        if 'sale_amount' in df.columns:
+            df['price'] = df['sale_amount'].apply(extract_price)
+        
+        # Extract views from views column (e.g., "11,735 views")
+        if 'views' in df.columns:
+            df['views_numeric'] = df['views'].apply(extract_numeric)
+            df['views'] = df['views_numeric']
+        
+        # Keep bids and comments as is (already numeric)
+        # bids, comments are already numeric
+        
+        # Determine if sold
+        if 'sale_type' in df.columns:
+            df['sold'] = (df['sale_type'] == 'sold').astype(int)
+        
+        # Year is already a column
         
         # Clean manufacturer names
         print("🧹 Cleaning BAT manufacturer names...")
@@ -116,11 +174,19 @@ def load_scraped_data():
             print(f"   After: {unique_after} unique manufacturers")
             print(f"   Reduction: {unique_before - unique_after} duplicates removed")
         
+        # Add date/quarter
+        if 'sale_date' in df.columns:
+            df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+        elif 'end_date' in df.columns:
+            df['date'] = pd.to_datetime(df['end_date'], errors='coerce')
+        
         all_data.append(df)
         print(f"  ✅ Loaded {len(df)} BAT records")
         
     except Exception as e:
         print(f"  ⚠️  No BAT data found in S3: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Load CNB data from S3
     try:
@@ -129,18 +195,22 @@ def load_scraped_data():
         df = pd.read_csv('temp_cnb.csv')
         df['data_source'] = 'CNB'
         
-        # Standardize column names
-        column_mapping = {
-            'title': 'model',
-            'highBid': 'price',
-            'numBids': 'bids',
-            'numComments': 'comments',
-            'numViews': 'views',
-            'status': 'sold',
-            'startTime': 'date',
-            'make': 'make'
-        }
-        df = df.rename(columns=column_mapping)
+        print(f"   📋 Raw CNB data: {len(df)} records")
+        
+        # Your actual CNB columns: model, make, vin, engine, drivetrain, transmission, body_style,
+        # exterior_color, interior_color, title_status, location, mileage, sale_amount, sale_date,
+        # sale_type, bids, views, comments, watchers, seller, auction_url, year, bids_original
+        
+        # Extract price from sale_amount (e.g., "$13,0009")
+        if 'sale_amount' in df.columns:
+            df['price'] = df['sale_amount'].apply(extract_price)
+        
+        # Views is already numeric in CNB
+        # bids, comments are already numeric
+        
+        # Determine if sold
+        if 'sale_type' in df.columns:
+            df['sold'] = (df['sale_type'] == 'sold').astype(int)
         
         # Filter out low-quality CNB entries (views < 50)
         if 'views' in df.columns:
@@ -162,11 +232,17 @@ def load_scraped_data():
             print(f"   After: {unique_after} unique manufacturers")
             print(f"   Reduction: {unique_before - unique_after} duplicates removed")
         
+        # Add date/quarter
+        if 'sale_date' in df.columns:
+            df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+        
         all_data.append(df)
         print(f"  ✅ Loaded {len(df)} CNB records")
         
     except Exception as e:
         print(f"  ⚠️  No CNB data found in S3: {e}")
+        import traceback
+        traceback.print_exc()
     
     if not all_data:
         raise Exception("No data files found in S3!")
@@ -182,38 +258,21 @@ def clean_and_process_data(df):
     print("\n🧹 Cleaning and processing data...")
     
     # Ensure numeric columns
-    numeric_cols = ['price', 'bids', 'comments', 'views']
+    numeric_cols = ['views', 'bids', 'comments', 'price']
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
     
-    # Extract year from model name
-    def extract_year(model_str):
-        if pd.isna(model_str):
-            return None
-        
-        # Look for 4-digit year (1900-2099)
-        match = re.search(r'\b(19\d{2}|20\d{2})\b', str(model_str))
-        if match:
-            year = int(match.group(1))
-            if 1900 <= year <= 2025:
-                return year
-        return None
-    
-    df['year'] = df['model'].apply(extract_year)
-    
     # Calculate age
-    current_year = datetime.datetime.now().year
-    df['age'] = current_year - df['year']
+    if 'year' in df.columns:
+        current_year = datetime.datetime.now().year
+        df['year'] = pd.to_numeric(df['year'], errors='coerce')
+        df['age'] = current_year - df['year']
+        
+        # Add decade
+        df['decade'] = (df['year'] // 10) * 10
     
-    # Add decade
-    df['decade'] = (df['year'] // 10) * 10
-    
-    # Handle sold status
-    if 'sold' in df.columns:
-        df['sold'] = df['sold'].apply(lambda x: 1 if x in ['sold', 'Sold', True, 1] else 0)
-    
-    # Parse dates
+    # Parse dates and create quarters
     if 'date' in df.columns:
         df['date'] = pd.to_datetime(df['date'], errors='coerce')
         df['quarter'] = df['date'].dt.to_period('Q').astype(str)
@@ -225,14 +284,25 @@ def clean_and_process_data(df):
     # Remove rows with missing critical data
     df = df.dropna(subset=['model', 'manufacturer'])
     
+    # Remove rows with zero price (no sale data)
+    if 'price' in df.columns:
+        price_before = len(df)
+        df = df[df['price'] > 0]
+        print(f"   ℹ️  Removed {price_before - len(df)} records with no price data")
+    
     print(f"✅ Cleaned data: {len(df)} records with {df['model'].nunique()} unique models")
-    print(f"   Average views: {df['views'].mean():.1f}")
-    print(f"   Average bids: {df['bids'].mean():.1f}")
+    if 'views' in df.columns:
+        print(f"   Average views: {df['views'].mean():.1f}")
+    if 'bids' in df.columns:
+        print(f"   Average bids: {df['bids'].mean():.1f}")
+    if 'price' in df.columns:
+        print(f"   Average price: ${df['price'].mean():,.0f}")
+        print(f"   Median price: ${df['price'].median():,.0f}")
     
     return df
 
 def calculate_mii_scores(df):
-    """Calculate MII (Market Interest Index) scores"""
+    """Calculate MII (Market Interest Index) scores with price as key component"""
     print("\n🧮 Calculating MII scores...")
     
     # Group by manufacturer, model, and quarter
@@ -240,7 +310,7 @@ def calculate_mii_scores(df):
         'views': 'sum',
         'bids': 'sum',
         'comments': 'sum',
-        'price': 'mean',
+        'price': 'mean',  # Average price for the model
         'sold': 'sum',
         'year': 'first',
         'age': 'mean',
@@ -256,7 +326,7 @@ def calculate_mii_scores(df):
     for quarter in grouped['quarter'].unique():
         quarter_mask = grouped['quarter'] == quarter
         
-        for metric in ['views', 'bids', 'comments', 'instagram_followers']:
+        for metric in ['views', 'bids', 'comments', 'price', 'instagram_followers']:
             if metric in grouped.columns:
                 max_val = grouped.loc[quarter_mask, metric].max()
                 if max_val > 0:
@@ -266,11 +336,13 @@ def calculate_mii_scores(df):
                     grouped.loc[quarter_mask, f'{metric}_normalized'] = 0
     
     # Calculate MII score with weighted components
+    # PRICE IS THE MOST IMPORTANT COMPONENT!
     weights = {
-        'views_normalized': 0.30,
-        'bids_normalized': 0.25,
-        'comments_normalized': 0.20,
-        'instagram_followers_normalized': 0.25
+        'price_normalized': 0.35,           # 35% - Price (most important!)
+        'bids_normalized': 0.25,            # 25% - Bidding activity
+        'views_normalized': 0.20,           # 20% - Interest/attention
+        'comments_normalized': 0.10,        # 10% - Community engagement
+        'instagram_followers_normalized': 0.10  # 10% - Social media presence
     }
     
     grouped['mii_score'] = sum(
@@ -283,69 +355,103 @@ def calculate_mii_scores(df):
     grouped['mii_score'] = grouped['mii_score'].round(2)
     
     # Add age-based bonus (classic cars get a small boost)
-    grouped.loc[grouped['age'].between(25, 50), 'mii_score'] *= 1.05
-    grouped.loc[grouped['age'] > 50, 'mii_score'] *= 1.10
+    if 'age' in grouped.columns:
+        grouped.loc[grouped['age'].between(25, 50), 'mii_score'] *= 1.05
+        grouped.loc[grouped['age'] > 50, 'mii_score'] *= 1.10
     
     # Sort by MII score
     grouped = grouped.sort_values('mii_score', ascending=False)
     
     print(f"✅ Calculated MII for {len(grouped)} model-quarter combinations")
+    print(f"\n💰 MII Score Composition:")
+    print(f"   Price:          35% (most important)")
+    print(f"   Bids:           25%")
+    print(f"   Views:          20%")
+    print(f"   Comments:       10%")
+    print(f"   Instagram:      10%")
     
     return grouped
 
 def generate_insights(mii_results):
     """Generate insights and rankings"""
     print("\n📊 GENERATING INSIGHTS")
-    print("=" * 60)
+    print("=" * 80)
     
     # Get latest quarter
     latest_quarter = mii_results['quarter'].max()
     latest_data = mii_results[mii_results['quarter'] == latest_quarter].copy()
     
     print(f"\n🏆 TOP 10 MODELS ({latest_quarter})")
-    print("-" * 75)
-    print(f"{'Rank':<6}{'Model':<35}{'MII':<9}{'Views':<11}{'Bids':<9}{'Year':<6}")
-    print("-" * 75)
+    print("-" * 80)
+    print(f"{'Rank':<6}{'Model':<30}{'MII':<9}{'Price':<12}{'Bids':<8}{'Views':<10}{'Year':<6}")
+    print("-" * 80)
     
     for i, row in latest_data.head(10).iterrows():
         rank = latest_data.index.get_loc(i) + 1
-        model_name = row['model'][:33]
+        model_name = row['model'][:28]
         year = int(row['year']) if pd.notna(row['year']) else 'N/A'
-        print(f"{rank:<6}{model_name:<35}{row['mii_score']:<9.1f}"
-              f"{int(row['views']):<11,}{int(row['bids']):<9}{year:<6}")
+        price_str = f"${row['price']:,.0f}" if pd.notna(row['price']) else 'N/A'
+        print(f"{rank:<6}{model_name:<30}{row['mii_score']:<9.1f}{price_str:<12}"
+              f"{int(row['bids']):<8}{int(row['views']):<10,}{year:<6}")
     
     # Top manufacturers
     print(f"\n\n🏭 TOP MANUFACTURERS BY AVERAGE MII ({latest_quarter})")
-    print("-" * 75)
+    print("-" * 80)
     manufacturer_stats = latest_data.groupby('manufacturer').agg({
         'mii_score': 'mean',
         'model': 'count',
+        'price': 'mean',
         'views': 'sum'
     }).round(2).sort_values('mii_score', ascending=False)
     
-    print(f"{'Rank':<6}{'Manufacturer':<25}{'Avg MII':<12}{'Models':<10}{'Total Views'}")
-    print("-" * 75)
+    print(f"{'Rank':<6}{'Manufacturer':<20}{'Avg MII':<11}{'Models':<9}{'Avg Price':<13}{'Views'}")
+    print("-" * 80)
     
     for idx, (manufacturer, row) in enumerate(manufacturer_stats.head(10).iterrows(), 1):
-        print(f"{idx:<6}{manufacturer:<25}{row['mii_score']:<12.1f}"
-              f"{int(row['model']):<10}{int(row['views']):,}")
+        price_str = f"${row['price']:,.0f}"
+        print(f"{idx:<6}{manufacturer:<20}{row['mii_score']:<11.1f}"
+              f"{int(row['model']):<9}{price_str:<13}{int(row['views']):,}")
+    
+    # Price tiers
+    print(f"\n\n💎 TOP MODELS BY PRICE TIER ({latest_quarter})")
+    print("-" * 80)
+    
+    price_tiers = [
+        (0, 50000, "Under $50K"),
+        (50000, 100000, "$50K-$100K"),
+        (100000, 200000, "$100K-$200K"),
+        (200000, float('inf'), "$200K+")
+    ]
+    
+    for min_price, max_price, label in price_tiers:
+        tier_data = latest_data[
+            (latest_data['price'] >= min_price) & (latest_data['price'] < max_price)
+        ].head(3)
+        
+        if not tier_data.empty:
+            print(f"\n{label}:")
+            for _, row in tier_data.iterrows():
+                model_name = row['model'][:35]
+                price_str = f"${row['price']:,.0f}"
+                print(f"  • {model_name:<35} MII: {row['mii_score']:<6.1f} Price: {price_str}")
     
     # Decade analysis
     if 'decade' in latest_data.columns:
         print(f"\n\n📅 TOP MODELS BY DECADE ({latest_quarter})")
-        print("-" * 75)
+        print("-" * 80)
         
         for decade in sorted(latest_data['decade'].dropna().unique(), reverse=True)[:5]:
             decade_data = latest_data[latest_data['decade'] == decade].head(3)
             if not decade_data.empty:
                 print(f"\n{int(decade)}s:")
                 for _, row in decade_data.iterrows():
-                    model_name = row['model'][:40]
-                    print(f"  • {model_name:<40} MII: {row['mii_score']:.1f}")
+                    model_name = row['model'][:30]
+                    price_str = f"${row['price']:,.0f}"
+                    print(f"  • {model_name:<30} MII: {row['mii_score']:<6.1f} Price: {price_str}")
     
     # Data source breakdown
     print(f"\n\n📈 DATA SOURCE BREAKDOWN")
-    print("-" * 75)
+    print("-" * 80)
     source_counts = mii_results['data_source'].value_counts()
     for source, count in source_counts.items():
         pct = (count / len(mii_results)) * 100
@@ -356,7 +462,7 @@ def generate_insights(mii_results):
 def save_and_upload_results(mii_results, latest_data):
     """Save results locally and upload to S3"""
     print("\n\n💾 SAVING AND UPLOADING RESULTS")
-    print("=" * 60)
+    print("=" * 80)
     
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
     
@@ -378,9 +484,10 @@ def save_and_upload_results(mii_results, latest_data):
 
 def main():
     """Main execution function"""
-    print("=" * 60)
+    print("=" * 80)
     print("🚀 MII Calculator with Manufacturer Name Cleanup")
-    print("=" * 60)
+    print("   Price-Focused Analysis (35% weight)")
+    print("=" * 80)
     print(f"⏰ Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
     try:
@@ -389,7 +496,7 @@ def main():
         
         # Show manufacturer statistics after cleanup
         print("\n📊 MANUFACTURER STATISTICS AFTER CLEANUP")
-        print("=" * 60)
+        print("=" * 80)
         stats = get_manufacturer_stats(df, 'manufacturer')
         print("\n🏆 Top 15 Manufacturers:")
         for _, row in stats.head(15).iterrows():
@@ -408,7 +515,7 @@ def main():
         save_and_upload_results(mii_results, latest_data)
         
         print(f"\n⏰ Completed at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 60)
+        print("=" * 80)
         
     except Exception as e:
         print(f"\n❌ Error: {e}")
