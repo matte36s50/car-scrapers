@@ -50,24 +50,74 @@ def extract_price(value):
     # Check if this is USD format (BAT) or $ format (CNB)
     is_usd_format = 'USD' in value_str
     
-    # Extract numbers and commas
-    # Pattern: find currency amount like $38,250 or 38250
-    match = re.search(r'\$?([\d,]+)', value_str)
+    if is_usd_format:
+        # BAT format: "USD $38,250" - straightforward extraction
+        match = re.search(r'\$?([\d,]+)', value_str)
+        if match:
+            amount_str = match.group(1).replace(',', '')
+            try:
+                return float(amount_str)
+            except:
+                return None
+    else:
+        # CNB format: "$13,0009" where last digit(s) are appended (not part of price)
+        # Pattern: The last 1-2 digits after the final comma group are extra
+        # Examples:
+        #   $13,0009 → $13,000 (remove "9")
+        #   $38,75012 → $38,750 (remove "12")
+        #   $7,10010 → $7,100 (remove "10")
+        
+        # Extract all digits
+        nums_only = re.sub(r'[^\d]', '', value_str)
+        
+        if nums_only and len(nums_only) > 0:
+            # CNB prices have 1-2 extra digits appended to the end
+            # If the number ends in a pattern like XX,XXXN or XX,XXXNN
+            # we need to remove that last N or NN
+            
+            # Strategy: Remove last digit if result ends in 0 or 5 (round number)
+            if len(nums_only) > 3:
+                # Try removing last 1 digit
+                price_try_1 = int(nums_only[:-1])
+                
+                # Try removing last 2 digits
+                price_try_2 = int(nums_only[:-2]) if len(nums_only) > 4 else 0
+                
+                # Heuristic: Auction prices typically end in 0, 00, 25, 50, 75
+                # Check which removal results in a rounder number
+                last_digit_1 = price_try_1 % 10
+                last_two_1 = price_try_1 % 100
+                
+                last_digit_2 = price_try_2 % 10 if price_try_2 > 0 else 99
+                last_two_2 = price_try_2 % 100 if price_try_2 > 0 else 99
+                
+                # Score roundness (0 is most round)
+                # Perfect: ends in 00, 25, 50, 75
+                # Good: ends in 0
+                # OK: ends in 5
+                def roundness_score(price):
+                    last_two = price % 100
+                    last_one = price % 10
+                    if last_two in [0, 25, 50, 75]:
+                        return 0  # Perfect
+                    elif last_one == 0:
+                        return 1  # Good
+                    elif last_one == 5:
+                        return 2  # OK
+                    else:
+                        return 3  # Not round
+                
+                score_1 = roundness_score(price_try_1)
+                score_2 = roundness_score(price_try_2)
+                
+                # Use the rounder one, prefer removing fewer digits if tied
+                if score_1 <= score_2:
+                    return float(price_try_1)
+                else:
+                    return float(price_try_2)
+            
+            return float(nums_only)
     
-    if match:
-        # Remove commas and convert to float
-        amount_str = match.group(1).replace(',', '')
-        try:
-            amount = float(amount_str)
-            
-            # Handle CNB's weird format where they append bid count (e.g., $13,0009 = $13,000 + 9 bids)
-            # Only apply to non-USD format (CNB data) and amounts > 10,000
-            if not is_usd_format and amount > 10000:
-                amount = amount // 10
-            
-            return amount
-        except:
-            return None
     return None
 
 def get_instagram_estimates(all_models):
