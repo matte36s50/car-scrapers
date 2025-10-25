@@ -60,63 +60,33 @@ def extract_price(value):
             except:
                 return None
     else:
-        # CNB format: "$13,0009" where last digit(s) are appended (not part of price)
-        # Pattern: The last 1-2 digits after the final comma group are extra
-        # Examples:
-        #   $13,0009 → $13,000 (remove "9")
-        #   $38,75012 → $38,750 (remove "12")
-        #   $7,10010 → $7,100 (remove "10")
+        # CNB format: "$38,75012" where digits after position 3 following the comma are junk
+        # The comma placement tells us the magnitude!
+        # $38,750 = $38k (comma after 2 digits = tens of thousands)
+        # $38,75012 = $38k (not $387k!) - extra digits "12" are appended junk
         
-        # Extract all digits
-        nums_only = re.sub(r'[^\d]', '', value_str)
-        
-        if nums_only and len(nums_only) > 0:
-            # CNB prices have 1-2 extra digits appended to the end
-            # If the number ends in a pattern like XX,XXXN or XX,XXXNN
-            # we need to remove that last N or NN
-            
-            # Strategy: Remove last digit if result ends in 0 or 5 (round number)
-            if len(nums_only) > 3:
-                # Try removing last 1 digit
-                price_try_1 = int(nums_only[:-1])
+        if ',' in value_str:
+            # Split by comma
+            parts = value_str.replace('$', '').split(',')
+            if len(parts) >= 2:
+                before_comma = parts[0]
+                after_comma = parts[1]
                 
-                # Try removing last 2 digits
-                price_try_2 = int(nums_only[:-2]) if len(nums_only) > 4 else 0
+                # After comma should be exactly 3 digits for the price
+                # Anything beyond 3 digits is appended data (month, day, record ID, etc.)
+                actual_price_digits = after_comma[:3]
                 
-                # Heuristic: Auction prices typically end in 0, 00, 25, 50, 75
-                # Check which removal results in a rounder number
-                last_digit_1 = price_try_1 % 10
-                last_two_1 = price_try_1 % 100
-                
-                last_digit_2 = price_try_2 % 10 if price_try_2 > 0 else 99
-                last_two_2 = price_try_2 % 100 if price_try_2 > 0 else 99
-                
-                # Score roundness (0 is most round)
-                # Perfect: ends in 00, 25, 50, 75
-                # Good: ends in 0
-                # OK: ends in 5
-                def roundness_score(price):
-                    last_two = price % 100
-                    last_one = price % 10
-                    if last_two in [0, 25, 50, 75]:
-                        return 0  # Perfect
-                    elif last_one == 0:
-                        return 1  # Good
-                    elif last_one == 5:
-                        return 2  # OK
-                    else:
-                        return 3  # Not round
-                
-                score_1 = roundness_score(price_try_1)
-                score_2 = roundness_score(price_try_2)
-                
-                # Use the rounder one, prefer removing fewer digits if tied
-                if score_1 <= score_2:
-                    return float(price_try_1)
-                else:
-                    return float(price_try_2)
-            
-            return float(nums_only)
+                # Reconstruct the price
+                price_str = before_comma + actual_price_digits
+                try:
+                    return float(price_str)
+                except:
+                    return None
+        else:
+            # No comma - just extract the number (rare cases like $18)
+            nums = re.sub(r'[^\d]', '', value_str)
+            if nums:
+                return float(nums)
     
     return None
 
@@ -400,7 +370,7 @@ def calculate_mii_scores(df):
     instagram_estimates = get_instagram_estimates(grouped['model'].unique())
     grouped['instagram_followers'] = grouped['model'].map(instagram_estimates)
     
-    # Normalize metrics (0-1 scale within each quarter)
+    # Normalize age (0-1 scale within each quarter) - older is better for classics
     for quarter in grouped['quarter'].unique():
         quarter_mask = grouped['quarter'] == quarter
         
@@ -412,15 +382,25 @@ def calculate_mii_scores(df):
                         grouped.loc[quarter_mask, metric] / max_val
                 else:
                     grouped.loc[quarter_mask, f'{metric}_normalized'] = 0
+        
+        # Normalize age - older cars get higher scores (classic car appeal)
+        if 'age' in grouped.columns:
+            max_age = grouped.loc[quarter_mask, 'age'].max()
+            if max_age > 0:
+                grouped.loc[quarter_mask, 'age_normalized'] = \
+                    grouped.loc[quarter_mask, 'age'] / max_age
+            else:
+                grouped.loc[quarter_mask, 'age_normalized'] = 0
     
-    # Calculate MII score with weighted components
-    # PRICE IS THE MOST IMPORTANT COMPONENT!
+    # Calculate base MII score with weighted components
+    # Balanced approach: price, engagement, and age
     weights = {
-        'price_normalized': 0.35,           # 35% - Price (most important!)
+        'price_normalized': 0.25,           # 25% - Price
         'bids_normalized': 0.25,            # 25% - Bidding activity
         'views_normalized': 0.20,           # 20% - Interest/attention
-        'comments_normalized': 0.10,        # 10% - Community engagement
-        'instagram_followers_normalized': 0.10  # 10% - Social media presence
+        'comments_normalized': 0.15,        # 15% - Community engagement
+        'instagram_followers_normalized': 0.10,  # 10% - Social media presence
+        'age_normalized': 0.05              # 5% - Age (classic car appeal)
     }
     
     grouped['mii_score'] = sum(
@@ -432,21 +412,17 @@ def calculate_mii_scores(df):
     # Round MII score
     grouped['mii_score'] = grouped['mii_score'].round(2)
     
-    # Add age-based bonus (classic cars get a small boost)
-    if 'age' in grouped.columns:
-        grouped.loc[grouped['age'].between(25, 50), 'mii_score'] *= 1.05
-        grouped.loc[grouped['age'] > 50, 'mii_score'] *= 1.10
-    
     # Sort by MII score
     grouped = grouped.sort_values('mii_score', ascending=False)
     
     print(f"✅ Calculated MII for {len(grouped)} model-quarter combinations")
-    print(f"\n💰 MII Score Composition:")
-    print(f"   Price:          35% (most important)")
+    print(f"\n💯 MII Score Composition:")
+    print(f"   Price:          25%")
     print(f"   Bids:           25%")
     print(f"   Views:          20%")
-    print(f"   Comments:       10%")
+    print(f"   Comments:       15%")
     print(f"   Instagram:      10%")
+    print(f"   Age (classic):   5%")
     
     return grouped
 
@@ -564,7 +540,7 @@ def main():
     """Main execution function"""
     print("=" * 80)
     print("🚀 MII Calculator with Manufacturer Name Cleanup")
-    print("   Price-Focused Analysis (35% weight)")
+    print("   Engagement-Focused with Classic Car Bonus (Age Weight)")
     print("=" * 80)
     print(f"⏰ Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
