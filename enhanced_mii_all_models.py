@@ -67,29 +67,18 @@ def extract_price(value):
                 return None
     else:
         # CNB format: "$38,75012" where digits after position 3 following the comma are junk
-        # The comma placement tells us the magnitude!
-        # $38,750 = $38k (comma after 2 digits = tens of thousands)
-        # $38,75012 = $38k (not $387k!) - extra digits "12" are appended junk
-        
         if ',' in value_str:
-            # Split by comma
             parts = value_str.replace('$', '').split(',')
             if len(parts) >= 2:
                 before_comma = parts[0]
                 after_comma = parts[1]
-                
-                # After comma should be exactly 3 digits for the price
-                # Anything beyond 3 digits is appended data (month, day, record ID, etc.)
                 actual_price_digits = after_comma[:3]
-                
-                # Reconstruct the price
                 price_str = before_comma + actual_price_digits
                 try:
                     return float(price_str)
                 except:
                     return None
         else:
-            # No comma - just extract the number (rare cases like $18)
             nums = re.sub(r'[^\d]', '', value_str)
             if nums:
                 return float(nums)
@@ -99,19 +88,12 @@ def extract_price(value):
 def extract_proper_model(model_text, make_text=None, original_model=None):
     """
     Extract proper model name, handling special cases like Mercedes AMG
-    
-    CRITICAL FIX: This prevents "AMG" from being the model name
-    Examples:
-    - "2015 Mercedes-Benz C63 AMG" -> "C63 AMG"
-    - "Mercedes-Benz AMG GT" -> "AMG GT"  
-    - "1987 BMW M3" -> "M3"
-    - "Porsche 911 Turbo" -> "911 Turbo"
     """
     if not model_text or pd.isna(model_text):
         return None
     
     model_str = str(model_text).strip()
-    original_model = original_model or model_str  # Keep original for fallback
+    original_model = original_model or model_str
     
     # Remove year if present at the start (4 digits)
     model_str = re.sub(r'^\d{4}\s+', '', model_str)
@@ -119,7 +101,7 @@ def extract_proper_model(model_text, make_text=None, original_model=None):
     # Remove year ranges like "(1990-2018)"
     model_str = re.sub(r'\s*\(\d{4}-\d{4}\)', '', model_str)
     
-    # Remove common make names (case insensitive, preserve rest)
+    # Remove common make names
     common_makes = [
         'Mercedes-Benz', 'Mercedes', 'BMW', 'Porsche', 'Audi', 'Ferrari',
         'Lamborghini', 'McLaren', 'Chevrolet', 'Chevy', 'Ford', 'Dodge', 'Tesla',
@@ -128,26 +110,22 @@ def extract_proper_model(model_text, make_text=None, original_model=None):
         'Rolls-Royce', 'Aston Martin', 'Lotus', 'Bugatti'
     ]
     
-    # Sort by length (longest first) to avoid partial matches
     common_makes.sort(key=len, reverse=True)
     
     for make in common_makes:
-        # Remove make name at the start, preserving everything after
         pattern = rf'^{re.escape(make)}[\s-]+'
         model_str = re.sub(pattern, '', model_str, flags=re.IGNORECASE)
     
-    # Clean up extra whitespace but preserve internal spacing
     model_str = re.sub(r'\s+', ' ', model_str).strip()
     
-    # CRITICAL CHECK: If result is just "AMG" or very short, something went wrong
+    # CRITICAL CHECK: If result is just "AMG", extract more context
     if model_str.upper() == 'AMG' or (len(model_str) < 3 and 'AMG' in str(original_model).upper()):
-        # Try to extract more context from original model text
-        # Pattern 1: Look for alphanumeric model code before AMG (e.g., "C63 AMG")
+        # Pattern 1: alphanumeric before AMG (e.g., "C63 AMG")
         amg_match = re.search(r'([A-Z0-9]+)\s+AMG', original_model, re.IGNORECASE)
         if amg_match:
             return f"{amg_match.group(1)} AMG"
         
-        # Pattern 2: Look for "AMG" followed by model (e.g., "AMG GT")
+        # Pattern 2: "AMG" followed by model (e.g., "AMG GT")
         amg_model_match = re.search(r'AMG\s+([A-Z][A-Z0-9\s]+)', original_model, re.IGNORECASE)
         if amg_model_match:
             return f"AMG {amg_model_match.group(1)}"
@@ -157,7 +135,6 @@ def extract_proper_model(model_text, make_text=None, original_model=None):
         if multi_word_match:
             return f"{multi_word_match.group(1)} AMG"
         
-        # If we STILL only have "AMG", this is a data quality issue - skip it
         print(f"  ⚠️  WARNING: Could not extract specific model from '{original_model}' - will be filtered out")
         return None
     
@@ -166,30 +143,19 @@ def extract_proper_model(model_text, make_text=None, original_model=None):
 def get_instagram_estimates(all_models):
     """Generate Instagram estimates for models"""
     known_estimates = {
-        # BMW Models
         "bmw": 650000, "m3": 280000, "e30": 18000, "e36": 15000, "e46": 42000,
         "2002": 12000, "z8": 4500, "m5": 14000, "m4": 35000, "z4": 22000,
-        
-        # Mercedes Models  
         "mercedes": 480000, "190e": 18000, "c63": 45000, "amg": 65000,
         "g-class": 55000, "sl": 18000,
-        
-        # Porsche Models
         "porsche": 450000, "911": 150000, "turbo": 45000, "gt3": 65000,
         "boxster": 28000, "cayman": 32000,
-        
-        # Japanese Performance
         "toyota": 180000, "supra": 55000, "mr2": 15000, "ae86": 18000,
         "nissan": 120000, "gtr": 38000, "skyline": 28000, "240z": 22000,
         "honda": 160000, "s2000": 35000, "nsx": 22000, "civic": 45000,
         "mazda": 85000, "rx-7": 28000, "miata": 42000,
-        
-        # American Muscle
         "ford": 180000, "mustang": 85000, "gt40": 12000, "bronco": 25000,
         "chevrolet": 150000, "corvette": 95000, "camaro": 65000,
         "dodge": 95000, "challenger": 45000, "viper": 18000,
-        
-        # Supercars
         "ferrari": 320000, "lamborghini": 280000, "mclaren": 85000,
         "aston martin": 65000, "bugatti": 55000,
     }
@@ -200,15 +166,13 @@ def get_instagram_estimates(all_models):
             continue
         
         model_clean = str(model).lower()
-        instagram_count = 8000  # Default
+        instagram_count = 8000
         
-        # Check for matches
         for key, count in known_estimates.items():
             if key in model_clean:
                 instagram_count = max(instagram_count, int(count * 0.3))
                 break
         
-        # Brand-based estimation
         if any(brand in model_clean for brand in ['bmw', 'mercedes', 'porsche', 'ferrari']):
             instagram_count = max(instagram_count, 20000)
         elif any(brand in model_clean for brand in ['toyota', 'honda', 'nissan']):
@@ -241,27 +205,18 @@ def load_scraped_data():
         
         print(f"   📋 Raw BAT data: {len(df)} records")
         
-        # Your actual BAT columns: auction_url, bids, category, comments, end_date, end_timestamp, 
-        # era, location, make, model, origin, partner, sale_amount, sale_date, sale_type, 
-        # seller_type, views, watchers, year
-        
-        # Extract price from sale_amount (e.g., "USD $38,250")
+        # Extract price from sale_amount
         if 'sale_amount' in df.columns:
             df['price'] = df['sale_amount'].apply(extract_price)
         
-        # Extract views from views column (e.g., "11,735 views")
+        # Extract views
         if 'views' in df.columns:
             df['views_numeric'] = df['views'].apply(extract_numeric)
             df['views'] = df['views_numeric']
         
-        # Keep bids and comments as is (already numeric)
-        # bids, comments are already numeric
-        
         # Determine if sold
         if 'sale_type' in df.columns:
             df['sold'] = (df['sale_type'] == 'sold').astype(int)
-        
-        # Year is already a column
         
         # Clean manufacturer names
         print("🧹 Cleaning BAT manufacturer names...")
@@ -274,13 +229,37 @@ def load_scraped_data():
             print(f"   After: {unique_after} unique manufacturers")
             print(f"   Reduction: {unique_before - unique_after} duplicates removed")
         
-        # Add date/quarter
+        # CRITICAL: Parse date properly with multiple formats
+        print("📅 Parsing dates...")
+        date_parsed = False
+        
+        # Try sale_date first (most reliable)
         if 'sale_date' in df.columns:
+            print("   Attempting to parse 'sale_date' column...")
             df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
-        elif 'end_date' in df.columns:
-            # BAT's end_date is text like "Monday, May 19 at 5:47pm" - not parseable
-            # Use sale_date instead
-            df['date'] = pd.to_datetime(df.get('sale_date', None), errors='coerce')
+            valid_dates = df['date'].notna().sum()
+            print(f"   Parsed {valid_dates} valid dates from sale_date")
+            if valid_dates > 0:
+                date_parsed = True
+        
+        # If sale_date didn't work, try end_timestamp
+        if not date_parsed and 'end_timestamp' in df.columns:
+            print("   Attempting to parse 'end_timestamp' column...")
+            df['date'] = pd.to_datetime(df['end_timestamp'], unit='s', errors='coerce')
+            valid_dates = df['date'].notna().sum()
+            print(f"   Parsed {valid_dates} valid dates from end_timestamp")
+            if valid_dates > 0:
+                date_parsed = True
+        
+        # Show date range
+        if date_parsed:
+            valid_dates_df = df[df['date'].notna()]
+            if len(valid_dates_df) > 0:
+                print(f"   📆 Date range: {valid_dates_df['date'].min()} to {valid_dates_df['date'].max()}")
+            else:
+                print("   ⚠️  WARNING: No valid dates found!")
+        else:
+            print("   ⚠️  WARNING: Could not parse any dates!")
         
         all_data.append(df)
         print(f"  ✅ Loaded {len(df)} BAT records")
@@ -290,7 +269,7 @@ def load_scraped_data():
         import traceback
         traceback.print_exc()
     
-    # Load CNB data from S3 - ONLY IF ENABLED
+    # Load CNB data if enabled
     if USE_CNB_DATA:
         try:
             print(f"📊 Downloading cnb.csv from S3...")
@@ -300,32 +279,22 @@ def load_scraped_data():
             
             print(f"   📋 Raw CNB data: {len(df)} records")
             
-            # CNB columns: model, make, vin, engine, drivetrain, transmission, body_style,
-            # exterior_color, interior_color, title_status, location, mileage,
-            # sale_amount, sale_date, sale_type, bids, views, seller, auction_url, year
-            
-            # Extract price from sale_amount (e.g., "$38,750")
             if 'sale_amount' in df.columns:
                 df['price'] = df['sale_amount'].apply(extract_price)
             
-            # Extract numeric views
             if 'views' in df.columns:
                 df['views_numeric'] = df['views'].apply(extract_numeric)
                 df['views'] = df['views_numeric']
             
-            # Extract numeric bids
             if 'bids' in df.columns:
                 df['bids_numeric'] = df['bids'].apply(extract_numeric)
                 df['bids'] = df['bids_numeric']
             
-            # CNB doesn't have comments - set to 0
             df['comments'] = 0
             
-            # Determine if sold
             if 'sale_type' in df.columns:
                 df['sold'] = (df['sale_type'] == 'sold').astype(int)
             
-            # Clean manufacturer names
             print("🧹 Cleaning CNB manufacturer names...")
             if 'make' in df.columns:
                 df['manufacturer'] = df['make']
@@ -336,7 +305,6 @@ def load_scraped_data():
                 print(f"   After: {unique_after} unique manufacturers")
                 print(f"   Reduction: {unique_before - unique_after} duplicates removed")
             
-            # Add date/quarter
             if 'sale_date' in df.columns:
                 df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
             
@@ -367,16 +335,14 @@ def load_scraped_data():
     return combined_df
 
 def validate_quarter(quarter_str):
-    """Validate that quarter is reasonable (not in future, not before 1990)"""
+    """Validate that quarter is reasonable"""
     if pd.isna(quarter_str):
         return False
     
     try:
-        # Extract year from quarter string (e.g., "2024-Q3" -> 2024)
         year = int(str(quarter_str).split('-')[0])
         current_year = datetime.datetime.now().year
         
-        # Must be between 1990 and current year
         if 1990 <= year <= current_year:
             return True
         return False
@@ -393,54 +359,70 @@ def clean_and_process_data(df):
     
     # Extract proper model names with AMG fix
     print(f"\n🔧 Extracting proper model names with AMG fix...")
-    df['model_original'] = df['model']  # Keep original for reference
+    df['model_original'] = df['model']
     df['model_clean'] = df.apply(
         lambda row: extract_proper_model(
             row['model'], 
             row.get('manufacturer', row.get('make', None)),
-            row['model']  # Pass original as fallback
+            row['model']
         ), 
         axis=1
     )
     
-    # Show some examples of model transformation
+    # Show examples
     print(f"\n📝 Model name transformation examples:")
     examples = df[df['model'] != df['model_clean']].head(10)
     for _, row in examples.iterrows():
         make = row.get('manufacturer', row.get('make', 'Unknown'))
         print(f"  {row['model']:<40} → {row['model_clean']:<40} [{make}]")
     
-    # CRITICAL: Filter out entries where model_clean is None (AMG-only entries)
+    # Filter out AMG-only entries
     amg_only_count = df['model_clean'].isna().sum()
     if amg_only_count > 0:
-        print(f"\n⚠️  Filtered out {amg_only_count} entries with just 'AMG' as model (data quality issue)")
+        print(f"\n⚠️  Filtered out {amg_only_count} entries with just 'AMG' as model")
         df = df[df['model_clean'].notna()].copy()
     else:
         print(f"\n✅ No 'AMG-only' Mercedes entries found!")
     
-    # Use cleaned model name
     df['model'] = df['model_clean']
     
     # Filter: Only sold auctions with valid prices
     df = df[
         (df['sold'] == 1) & 
         (df['price'].notna()) & 
-        (df['price'] > 100) &  # Minimum realistic price
-        (df['price'] < 10_000_000)  # Maximum realistic price (filters out data errors)
+        (df['price'] > 100) &
+        (df['price'] < 10_000_000)
     ].copy()
     
     print(f"\n🔍 After filtering sold auctions with valid prices:")
     print(f"   Records: {len(df):,} (removed {initial_count - len(df):,})")
     
-    # Add quarter
+    # CRITICAL: Add quarter with better error handling
+    print(f"\n📅 Creating quarters from dates...")
+    valid_dates = df['date'].notna().sum()
+    print(f"   Valid dates available: {valid_dates:,} ({valid_dates/len(df)*100:.1f}%)")
+    
+    if valid_dates == 0:
+        raise Exception("❌ CRITICAL ERROR: No valid dates found! Cannot create quarters.")
+    
+    # Create quarter only for rows with valid dates
     df['quarter'] = df['date'].dt.to_period('Q').astype(str)
     
-    # Validate quarters (remove future quarters)
+    # Show quarter distribution
+    print(f"\n📊 Quarter distribution:")
+    quarter_counts = df['quarter'].value_counts().sort_index()
+    print(f"   Total unique quarters: {len(quarter_counts)}")
+    print(f"   Latest quarter: {quarter_counts.index[-1] if len(quarter_counts) > 0 else 'None'}")
+    print(f"   Earliest quarter: {quarter_counts.index[0] if len(quarter_counts) > 0 else 'None'}")
+    print(f"\n   Top 5 quarters by record count:")
+    for quarter, count in quarter_counts.tail(5).items():
+        print(f"      {quarter}: {count:,} records")
+    
+    # Validate quarters
     df['quarter_valid'] = df['quarter'].apply(validate_quarter)
     invalid_quarters = df[~df['quarter_valid']]
     if len(invalid_quarters) > 0:
-        print(f"\n⚠️  Filtering out {len(invalid_quarters)} records with invalid quarters:")
-        print(f"   Sample invalid quarters: {invalid_quarters['quarter'].unique()[:5]}")
+        print(f"\n⚠️  Filtering out {len(invalid_quarters)} records with invalid quarters")
         df = df[df['quarter_valid']].copy()
     
     # Add year and age
@@ -479,12 +461,14 @@ def calculate_mii_scores(df):
         'data_source': 'first'
     }).reset_index()
     
+    print(f"✅ Created {len(grouped):,} model-quarter combinations")
+    
     # Get Instagram estimates
     print(f"🔍 Estimating Instagram followers for {grouped['model'].nunique()} unique models...")
     instagram_estimates = get_instagram_estimates(grouped['model'].unique())
     grouped['instagram_followers'] = grouped['model'].map(instagram_estimates)
     
-    # Normalize age (0-1 scale within each quarter) - older is better for classics
+    # Normalize within each quarter
     for quarter in grouped['quarter'].unique():
         quarter_mask = grouped['quarter'] == quarter
         
@@ -497,7 +481,7 @@ def calculate_mii_scores(df):
                 else:
                     grouped.loc[quarter_mask, f'{metric}_normalized'] = 0
         
-        # Normalize age - older cars get higher scores (classic car appeal)
+        # Normalize age
         if 'age' in grouped.columns:
             max_age = grouped.loc[quarter_mask, 'age'].max()
             if max_age > 0:
@@ -506,15 +490,14 @@ def calculate_mii_scores(df):
             else:
                 grouped.loc[quarter_mask, 'age_normalized'] = 0
     
-    # Calculate base MII score with weighted components
-    # Balanced approach: price, engagement, and age
+    # Calculate MII score
     weights = {
-        'price_normalized': 0.25,           # 25% - Price
-        'bids_normalized': 0.25,            # 25% - Bidding activity
-        'views_normalized': 0.20,           # 20% - Interest/attention
-        'comments_normalized': 0.15,        # 15% - Community engagement
-        'instagram_followers_normalized': 0.10,  # 10% - Social media presence
-        'age_normalized': 0.05              # 5% - Age (classic car appeal)
+        'price_normalized': 0.25,
+        'bids_normalized': 0.25,
+        'views_normalized': 0.20,
+        'comments_normalized': 0.15,
+        'instagram_followers_normalized': 0.10,
+        'age_normalized': 0.05
     }
     
     grouped['mii_score'] = sum(
@@ -523,10 +506,7 @@ def calculate_mii_scores(df):
         if metric in grouped.columns
     ) * 100
     
-    # Round MII score
     grouped['mii_score'] = grouped['mii_score'].round(2)
-    
-    # Sort by MII score
     grouped = grouped.sort_values('mii_score', ascending=False)
     
     print(f"✅ Calculated MII for {len(grouped)} model-quarter combinations")
@@ -547,7 +527,16 @@ def generate_insights(mii_results):
     
     # Get latest quarter
     latest_quarter = mii_results['quarter'].max()
+    print(f"\n📅 Latest quarter identified: {latest_quarter}")
+    
+    if pd.isna(latest_quarter):
+        print("❌ ERROR: No valid quarter found in MII results!")
+        print("\nAvailable quarters in dataset:")
+        print(mii_results['quarter'].value_counts())
+        raise Exception("Cannot generate insights without valid quarter data")
+    
     latest_data = mii_results[mii_results['quarter'] == latest_quarter].copy()
+    print(f"   Records in latest quarter: {len(latest_data):,}")
     
     print(f"\n🏆 TOP 10 MODELS ({latest_quarter})")
     print("-" * 80)
@@ -664,7 +653,7 @@ def main():
         # Load data
         df = load_scraped_data()
         
-        # Show manufacturer statistics after cleanup
+        # Show manufacturer statistics
         print("\n📊 MANUFACTURER STATISTICS AFTER CLEANUP")
         print("=" * 80)
         stats = get_manufacturer_stats(df, 'manufacturer')
