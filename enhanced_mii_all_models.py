@@ -7,6 +7,12 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from manufacturer_cleanup import clean_manufacturer_column, get_manufacturer_stats
 
+# ============================================================================
+# CONFIGURATION: Set to False to temporarily disable CNB data
+# ============================================================================
+USE_CNB_DATA = False  # Set to True when CNB scraper is fixed
+# ============================================================================
+
 def upload_to_s3(file_name, bucket, object_name=None):
     """Upload file to S3 bucket"""
     s3 = boto3.client('s3')
@@ -90,6 +96,73 @@ def extract_price(value):
     
     return None
 
+def extract_proper_model(model_text, make_text=None, original_model=None):
+    """
+    Extract proper model name, handling special cases like Mercedes AMG
+    
+    CRITICAL FIX: This prevents "AMG" from being the model name
+    Examples:
+    - "2015 Mercedes-Benz C63 AMG" -> "C63 AMG"
+    - "Mercedes-Benz AMG GT" -> "AMG GT"  
+    - "1987 BMW M3" -> "M3"
+    - "Porsche 911 Turbo" -> "911 Turbo"
+    """
+    if not model_text or pd.isna(model_text):
+        return None
+    
+    model_str = str(model_text).strip()
+    original_model = original_model or model_str  # Keep original for fallback
+    
+    # Remove year if present at the start (4 digits)
+    model_str = re.sub(r'^\d{4}\s+', '', model_str)
+    
+    # Remove year ranges like "(1990-2018)"
+    model_str = re.sub(r'\s*\(\d{4}-\d{4}\)', '', model_str)
+    
+    # Remove common make names (case insensitive, preserve rest)
+    common_makes = [
+        'Mercedes-Benz', 'Mercedes', 'BMW', 'Porsche', 'Audi', 'Ferrari',
+        'Lamborghini', 'McLaren', 'Chevrolet', 'Chevy', 'Ford', 'Dodge', 'Tesla',
+        'Toyota', 'Honda', 'Nissan', 'Lexus', 'Acura', 'Infiniti', 'Jaguar',
+        'Land Rover', 'Range Rover', 'Alfa Romeo', 'Maserati', 'Bentley',
+        'Rolls-Royce', 'Aston Martin', 'Lotus', 'Bugatti'
+    ]
+    
+    # Sort by length (longest first) to avoid partial matches
+    common_makes.sort(key=len, reverse=True)
+    
+    for make in common_makes:
+        # Remove make name at the start, preserving everything after
+        pattern = rf'^{re.escape(make)}[\s-]+'
+        model_str = re.sub(pattern, '', model_str, flags=re.IGNORECASE)
+    
+    # Clean up extra whitespace but preserve internal spacing
+    model_str = re.sub(r'\s+', ' ', model_str).strip()
+    
+    # CRITICAL CHECK: If result is just "AMG" or very short, something went wrong
+    if model_str.upper() == 'AMG' or (len(model_str) < 3 and 'AMG' in str(original_model).upper()):
+        # Try to extract more context from original model text
+        # Pattern 1: Look for alphanumeric model code before AMG (e.g., "C63 AMG")
+        amg_match = re.search(r'([A-Z0-9]+)\s+AMG', original_model, re.IGNORECASE)
+        if amg_match:
+            return f"{amg_match.group(1)} AMG"
+        
+        # Pattern 2: Look for "AMG" followed by model (e.g., "AMG GT")
+        amg_model_match = re.search(r'AMG\s+([A-Z][A-Z0-9\s]+)', original_model, re.IGNORECASE)
+        if amg_model_match:
+            return f"AMG {amg_model_match.group(1)}"
+        
+        # Pattern 3: Multiple words before AMG
+        multi_word_match = re.search(r'([A-Z][A-Z0-9]*(?:\s+[A-Z][A-Z0-9]*)*)\s+AMG', original_model, re.IGNORECASE)
+        if multi_word_match:
+            return f"{multi_word_match.group(1)} AMG"
+        
+        # If we STILL only have "AMG", this is a data quality issue - skip it
+        print(f"  ⚠️  WARNING: Could not extract specific model from '{original_model}' - will be filtered out")
+        return None
+    
+    return model_str if model_str else None
+
 def get_instagram_estimates(all_models):
     """Generate Instagram estimates for models"""
     known_estimates = {
@@ -148,6 +221,13 @@ def get_instagram_estimates(all_models):
 def load_scraped_data():
     """Load data from single bat.csv and cnb.csv files in S3"""
     print("📋 Looking for scraped data in S3...")
+    
+    if not USE_CNB_DATA:
+        print("\n" + "="*80)
+        print("⚠️  CNB DATA TEMPORARILY DISABLED")
+        print("   Only using BAT data for MII calculations")
+        print("   Set USE_CNB_DATA = True in the script to re-enable CNB data")
+        print("="*80 + "\n")
     
     s3 = boto3.client('s3')
     all_data = []
@@ -210,163 +290,197 @@ def load_scraped_data():
         import traceback
         traceback.print_exc()
     
-    # Load CNB data from S3
-    try:
-        print(f"📊 Downloading cnb.csv from S3...")
-        s3.download_file('my-mii-reports', 'cnb.csv', 'temp_cnb.csv')
-        df = pd.read_csv('temp_cnb.csv')
-        df['data_source'] = 'CNB'
-        
-        print(f"   📋 Raw CNB data: {len(df)} records")
-        
-        # Your actual CNB columns: model, make, vin, engine, drivetrain, transmission, body_style,
-        # exterior_color, interior_color, title_status, location, mileage, sale_amount, sale_date,
-        # sale_type, bids, views, comments, watchers, seller, auction_url, year, bids_original
-        
-        # Extract price from sale_amount (e.g., "$13,0009")
-        if 'sale_amount' in df.columns:
-            df['price'] = df['sale_amount'].apply(extract_price)
-        
-        # Views is already numeric in CNB
-        # bids, comments are already numeric
-        
-        # Determine if sold
-        if 'sale_type' in df.columns:
-            df['sold'] = (df['sale_type'] == 'sold').astype(int)
-        
-        # Filter out low-quality CNB entries (views < 50)
-        if 'views' in df.columns:
-            initial_count = len(df)
-            low_view_count = len(df[df['views'] < 50])
-            df = df[df['views'] >= 50]
-            print(f"  ⚠️  DATA QUALITY FILTERING:")
-            print(f"     Found {low_view_count} CNB entries with views < 50")
-            print(f"     ✅ Filtered out {initial_count - len(df)} low-quality entries")
-        
-        # Clean manufacturer names
-        print("🧹 Cleaning CNB manufacturer names...")
-        if 'make' in df.columns:
-            df['manufacturer'] = df['make']
-            unique_before = df['make'].nunique()
-            df = clean_manufacturer_column(df, manufacturer_col='manufacturer', model_col='model')
-            unique_after = df['manufacturer'].nunique()
-            print(f"   Before: {unique_before} unique manufacturers")
-            print(f"   After: {unique_after} unique manufacturers")
-            print(f"   Reduction: {unique_before - unique_after} duplicates removed")
-        
-        # Add date/quarter
-        if 'sale_date' in df.columns:
-            df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
-        
-        all_data.append(df)
-        print(f"  ✅ Loaded {len(df)} CNB records")
-        
-    except Exception as e:
-        print(f"  ⚠️  No CNB data found in S3: {e}")
-        import traceback
-        traceback.print_exc()
+    # Load CNB data from S3 - ONLY IF ENABLED
+    if USE_CNB_DATA:
+        try:
+            print(f"📊 Downloading cnb.csv from S3...")
+            s3.download_file('my-mii-reports', 'cnb_sitemap_full_cleaned.csv', 'temp_cnb.csv')
+            df = pd.read_csv('temp_cnb.csv')
+            df['data_source'] = 'CNB'
+            
+            print(f"   📋 Raw CNB data: {len(df)} records")
+            
+            # CNB columns: model, make, vin, engine, drivetrain, transmission, body_style,
+            # exterior_color, interior_color, title_status, location, mileage,
+            # sale_amount, sale_date, sale_type, bids, views, seller, auction_url, year
+            
+            # Extract price from sale_amount (e.g., "$38,750")
+            if 'sale_amount' in df.columns:
+                df['price'] = df['sale_amount'].apply(extract_price)
+            
+            # Extract numeric views
+            if 'views' in df.columns:
+                df['views_numeric'] = df['views'].apply(extract_numeric)
+                df['views'] = df['views_numeric']
+            
+            # Extract numeric bids
+            if 'bids' in df.columns:
+                df['bids_numeric'] = df['bids'].apply(extract_numeric)
+                df['bids'] = df['bids_numeric']
+            
+            # CNB doesn't have comments - set to 0
+            df['comments'] = 0
+            
+            # Determine if sold
+            if 'sale_type' in df.columns:
+                df['sold'] = (df['sale_type'] == 'sold').astype(int)
+            
+            # Clean manufacturer names
+            print("🧹 Cleaning CNB manufacturer names...")
+            if 'make' in df.columns:
+                df['manufacturer'] = df['make']
+                unique_before = df['make'].nunique()
+                df = clean_manufacturer_column(df, manufacturer_col='manufacturer', model_col='model')
+                unique_after = df['manufacturer'].nunique()
+                print(f"   Before: {unique_before} unique manufacturers")
+                print(f"   After: {unique_after} unique manufacturers")
+                print(f"   Reduction: {unique_before - unique_after} duplicates removed")
+            
+            # Add date/quarter
+            if 'sale_date' in df.columns:
+                df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
+            
+            all_data.append(df)
+            print(f"  ✅ Loaded {len(df)} CNB records")
+            
+        except Exception as e:
+            print(f"  ⚠️  No CNB data found in S3: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        print(f"  ⏭️  Skipping CNB data (disabled in configuration)")
     
     if not all_data:
-        raise Exception("No data files found in S3!")
+        raise Exception("No data loaded from either BAT or CNB!")
     
     # Combine all data
     combined_df = pd.concat(all_data, ignore_index=True)
-    print(f"📈 Combined total: {len(combined_df)} auction records")
+    print(f"\n✅ Total records loaded: {len(combined_df):,}")
+    
+    # Show data source breakdown
+    print(f"\n📊 Data Source Breakdown:")
+    for source in combined_df['data_source'].unique():
+        count = len(combined_df[combined_df['data_source'] == source])
+        pct = (count / len(combined_df)) * 100
+        print(f"   {source:<10} {count:>8,} records ({pct:>5.1f}%)")
     
     return combined_df
 
-def clean_and_process_data(df):
-    """Clean and process the combined data"""
-    print("\n🧹 Cleaning and processing data...")
+def validate_quarter(quarter_str):
+    """Validate that quarter is reasonable (not in future, not before 1990)"""
+    if pd.isna(quarter_str):
+        return False
     
-    # Ensure numeric columns
-    numeric_cols = ['views', 'bids', 'comments', 'price']
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-    
-    # Calculate age
-    if 'year' in df.columns:
+    try:
+        # Extract year from quarter string (e.g., "2024-Q3" -> 2024)
+        year = int(str(quarter_str).split('-')[0])
         current_year = datetime.datetime.now().year
-        df['year'] = pd.to_numeric(df['year'], errors='coerce')
-        df['age'] = current_year - df['year']
         
-        # Add decade
-        df['decade'] = (df['year'] // 10) * 10
+        # Must be between 1990 and current year
+        if 1990 <= year <= current_year:
+            return True
+        return False
+    except:
+        return False
+
+def clean_and_process_data(df):
+    """Clean and prepare data for MII calculation"""
+    print("\n🧹 CLEANING AND PROCESSING DATA")
+    print("=" * 80)
     
-    # Parse dates and create quarters with smart fallback
-    current_quarter = pd.Period(datetime.datetime.now(), freq='Q')
-    current_quarter_str = str(current_quarter)
-    current_year = datetime.datetime.now().year
+    initial_count = len(df)
+    print(f"Starting records: {initial_count:,}")
     
-    if 'date' in df.columns:
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        
-        # Filter out bad years (e.g., 2069)
-        if df['date'].notna().any():
-            bad_years = df['date'].dt.year > current_year + 10
-            bad_year_count = bad_years.sum()
-            if bad_year_count > 0:
-                print(f"   ⚠️  Filtered out {bad_year_count} records with invalid future years")
-                df = df[~bad_years]
-        
-        df['quarter'] = df['date'].dt.to_period('Q').astype(str)
-        
-        # Replace NaT quarters with current quarter (these are recent auctions without dates)
-        nat_mask = (df['quarter'] == 'NaT') | df['quarter'].isna()
-        nat_count = nat_mask.sum()
-        if nat_count > 0:
-            print(f"   ℹ️  Assigned {nat_count} auctions without dates to {current_quarter_str}")
-            df.loc[nat_mask, 'quarter'] = current_quarter_str
+    # Extract proper model names with AMG fix
+    print(f"\n🔧 Extracting proper model names with AMG fix...")
+    df['model_original'] = df['model']  # Keep original for reference
+    df['model_clean'] = df.apply(
+        lambda row: extract_proper_model(
+            row['model'], 
+            row.get('manufacturer', row.get('make', None)),
+            row['model']  # Pass original as fallback
+        ), 
+        axis=1
+    )
+    
+    # Show some examples of model transformation
+    print(f"\n📝 Model name transformation examples:")
+    examples = df[df['model'] != df['model_clean']].head(10)
+    for _, row in examples.iterrows():
+        make = row.get('manufacturer', row.get('make', 'Unknown'))
+        print(f"  {row['model']:<40} → {row['model_clean']:<40} [{make}]")
+    
+    # CRITICAL: Filter out entries where model_clean is None (AMG-only entries)
+    amg_only_count = df['model_clean'].isna().sum()
+    if amg_only_count > 0:
+        print(f"\n⚠️  Filtered out {amg_only_count} entries with just 'AMG' as model (data quality issue)")
+        df = df[df['model_clean'].notna()].copy()
     else:
-        # Default all to current quarter
-        df['quarter'] = current_quarter_str
+        print(f"\n✅ No 'AMG-only' Mercedes entries found!")
     
-    # Remove rows with missing critical data
-    df = df.dropna(subset=['model', 'manufacturer'])
+    # Use cleaned model name
+    df['model'] = df['model_clean']
     
-    # Remove rows with zero price (no sale data)
-    if 'price' in df.columns:
-        price_before = len(df)
-        df = df[df['price'] > 0]
-        print(f"   ℹ️  Removed {price_before - len(df)} records with no price data")
+    # Filter: Only sold auctions with valid prices
+    df = df[
+        (df['sold'] == 1) & 
+        (df['price'].notna()) & 
+        (df['price'] > 100) &  # Minimum realistic price
+        (df['price'] < 10_000_000)  # Maximum realistic price (filters out data errors)
+    ].copy()
     
-    print(f"✅ Cleaned data: {len(df)} records with {df['model'].nunique()} unique models")
-    if 'views' in df.columns:
-        print(f"   Average views: {df['views'].mean():.1f}")
-    if 'bids' in df.columns:
-        print(f"   Average bids: {df['bids'].mean():.1f}")
-    if 'price' in df.columns:
-        print(f"   Average price: ${df['price'].mean():,.0f}")
-        print(f"   Median price: ${df['price'].median():,.0f}")
+    print(f"\n🔍 After filtering sold auctions with valid prices:")
+    print(f"   Records: {len(df):,} (removed {initial_count - len(df):,})")
     
-    # Show quarter distribution
-    print(f"\n📅 Quarter Distribution:")
-    quarter_dist = df['quarter'].value_counts().sort_index(ascending=False)
-    for quarter, count in quarter_dist.head(8).items():
-        pct = (count / len(df)) * 100
-        print(f"   {quarter}: {count:>6,} auctions ({pct:>5.1f}%)")
+    # Add quarter
+    df['quarter'] = df['date'].dt.to_period('Q').astype(str)
+    
+    # Validate quarters (remove future quarters)
+    df['quarter_valid'] = df['quarter'].apply(validate_quarter)
+    invalid_quarters = df[~df['quarter_valid']]
+    if len(invalid_quarters) > 0:
+        print(f"\n⚠️  Filtering out {len(invalid_quarters)} records with invalid quarters:")
+        print(f"   Sample invalid quarters: {invalid_quarters['quarter'].unique()[:5]}")
+        df = df[df['quarter_valid']].copy()
+    
+    # Add year and age
+    current_year = datetime.datetime.now().year
+    df['age'] = current_year - df['year']
+    df['decade'] = (df['year'] // 10) * 10
+    
+    # Required columns
+    required = ['manufacturer', 'model', 'year', 'quarter', 'price', 'views', 'bids']
+    df = df.dropna(subset=required)
+    
+    print(f"\n✅ Clean dataset ready:")
+    print(f"   Records: {len(df):,}")
+    print(f"   Manufacturers: {df['manufacturer'].nunique()}")
+    print(f"   Models: {df['model'].nunique()}")
+    print(f"   Quarters: {df['quarter'].nunique()}")
+    print(f"   Date range: {df['date'].min()} to {df['date'].max()}")
     
     return df
 
 def calculate_mii_scores(df):
-    """Calculate MII (Market Interest Index) scores with price as key component"""
-    print("\n🧮 Calculating MII scores...")
+    """Calculate MII scores for each model/quarter combination"""
+    print("\n📊 CALCULATING MII SCORES")
+    print("=" * 80)
     
     # Group by manufacturer, model, and quarter
     grouped = df.groupby(['manufacturer', 'model', 'quarter']).agg({
-        'views': 'sum',
-        'bids': 'sum',
-        'comments': 'sum',
-        'price': 'mean',  # Average price for the model
-        'sold': 'sum',
-        'year': 'first',
+        'price': 'mean',
+        'views': 'mean',
+        'bids': 'mean',
+        'comments': 'mean',
+        'year': 'mean',
         'age': 'mean',
         'decade': 'first',
-        'data_source': lambda x: ','.join(x.unique())
+        'sold': 'sum',
+        'data_source': 'first'
     }).reset_index()
     
     # Get Instagram estimates
+    print(f"🔍 Estimating Instagram followers for {grouped['model'].nunique()} unique models...")
     instagram_estimates = get_instagram_estimates(grouped['model'].unique())
     grouped['instagram_followers'] = grouped['model'].map(instagram_estimates)
     
@@ -541,6 +655,8 @@ def main():
     print("=" * 80)
     print("🚀 MII Calculator with Manufacturer Name Cleanup")
     print("   Engagement-Focused with Classic Car Bonus (Age Weight)")
+    if not USE_CNB_DATA:
+        print("   ⚠️  CNB DATA TEMPORARILY DISABLED - BAT DATA ONLY")
     print("=" * 80)
     print(f"⏰ Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     
