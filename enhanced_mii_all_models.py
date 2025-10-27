@@ -120,14 +120,17 @@ def extract_proper_model(model_text, make_text=None, original_model=None):
     
     # CRITICAL CHECK: If result is just "AMG", extract more context
     if model_str.upper() == 'AMG' or (len(model_str) < 3 and 'AMG' in str(original_model).upper()):
+        # Pattern 1: alphanumeric before AMG (e.g., "C63 AMG")
         amg_match = re.search(r'([A-Z0-9]+)\s+AMG', original_model, re.IGNORECASE)
         if amg_match:
             return f"{amg_match.group(1)} AMG"
         
+        # Pattern 2: "AMG" followed by model (e.g., "AMG GT")
         amg_model_match = re.search(r'AMG\s+([A-Z][A-Z0-9\s]+)', original_model, re.IGNORECASE)
         if amg_model_match:
             return f"AMG {amg_model_match.group(1)}"
         
+        # Pattern 3: Multiple words before AMG
         multi_word_match = re.search(r'([A-Z][A-Z0-9]*(?:\s+[A-Z][A-Z0-9]*)*)\s+AMG', original_model, re.IGNORECASE)
         if multi_word_match:
             return f"{multi_word_match.group(1)} AMG"
@@ -226,43 +229,36 @@ def load_scraped_data():
             print(f"   After: {unique_after} unique manufacturers")
             print(f"   Reduction: {unique_before - unique_after} duplicates removed")
         
-        # CRITICAL FIX: Parse dates with explicit format to handle 2-digit years correctly
+        # CRITICAL: Parse date properly with multiple formats
         print("📅 Parsing dates...")
         date_parsed = False
         
+        # Try sale_date first (most reliable)
         if 'sale_date' in df.columns:
             print("   Attempting to parse 'sale_date' column...")
-            # Parse dates with dayfirst=False to handle MM/DD/YY format
-            # This ensures '5/19/25' is May 19, not invalid date
-            df['date'] = pd.to_datetime(df['sale_date'], format='mixed', errors='coerce')
-            
-            # Fix 2-digit year issue: pandas may interpret as 2069, should be 2025
-            # Any date > today must have century adjusted
-            current_year = datetime.datetime.now().year
-            future_dates = df['date'] > datetime.datetime.now()
-            
-            if future_dates.sum() > 0:
-                print(f"   ⚠️  Found {future_dates.sum()} dates parsed as future - adjusting century...")
-                # Subtract 100 years from future dates
-                df.loc[future_dates, 'date'] = df.loc[future_dates, 'date'] - pd.DateOffset(years=100)
-            
+            df['date'] = pd.to_datetime(df['sale_date'], errors='coerce')
             valid_dates = df['date'].notna().sum()
-            print(f"   Parsed {valid_dates} valid dates from sale_date ({valid_dates/len(df)*100:.1f}%)")
+            print(f"   Parsed {valid_dates} valid dates from sale_date")
             if valid_dates > 0:
-                print(f"   📆 Date range: {df['date'].min()} to {df['date'].max()}")
                 date_parsed = True
         
-        # Fallback to end_timestamp if sale_date didn't work
+        # If sale_date didn't work, try end_timestamp
         if not date_parsed and 'end_timestamp' in df.columns:
             print("   Attempting to parse 'end_timestamp' column...")
             df['date'] = pd.to_datetime(df['end_timestamp'], unit='s', errors='coerce')
             valid_dates = df['date'].notna().sum()
-            print(f"   Parsed {valid_dates} valid dates from end_timestamp ({valid_dates/len(df)*100:.1f}%)")
+            print(f"   Parsed {valid_dates} valid dates from end_timestamp")
             if valid_dates > 0:
-                print(f"   📆 Date range: {df['date'].min()} to {df['date'].max()}")
                 date_parsed = True
         
-        if not date_parsed:
+        # Show date range
+        if date_parsed:
+            valid_dates_df = df[df['date'].notna()]
+            if len(valid_dates_df) > 0:
+                print(f"   📆 Date range: {valid_dates_df['date'].min()} to {valid_dates_df['date'].max()}")
+            else:
+                print("   ⚠️  WARNING: No valid dates found!")
+        else:
             print("   ⚠️  WARNING: Could not parse any dates!")
         
         all_data.append(df)
@@ -339,12 +335,17 @@ def load_scraped_data():
     return combined_df
 
 def validate_quarter(quarter_str):
-    """Validate that quarter is reasonable"""
+    """Validate that quarter is reasonable - FIXED to handle both formats"""
     if pd.isna(quarter_str):
         return False
     
     try:
-        year = int(str(quarter_str).split('-')[0])
+        quarter_str = str(quarter_str)
+        # Handle both "2025Q3" and "2025-Q3" formats
+        if 'Q' in quarter_str:
+            year = int(quarter_str.split('Q')[0])
+        else:
+            year = int(quarter_str.split('-')[0])
         current_year = datetime.datetime.now().year
         
         if 1990 <= year <= current_year:
@@ -416,12 +417,11 @@ def clean_and_process_data(df):
     print(f"\n📊 Quarter distribution:")
     quarter_counts = df['quarter'].value_counts().sort_index()
     print(f"   Total unique quarters: {len(quarter_counts)}")
-    if len(quarter_counts) > 0:
-        print(f"   Latest quarter: {quarter_counts.index[-1]}")
-        print(f"   Earliest quarter: {quarter_counts.index[0]}")
-        print(f"\n   Top 5 quarters by record count:")
-        for quarter, count in quarter_counts.tail(5).items():
-            print(f"      {quarter}: {count:,} records")
+    print(f"   Latest quarter: {quarter_counts.index[-1] if len(quarter_counts) > 0 else 'None'}")
+    print(f"   Earliest quarter: {quarter_counts.index[0] if len(quarter_counts) > 0 else 'None'}")
+    print(f"\n   Top 5 quarters by record count:")
+    for quarter, count in quarter_counts.tail(5).items():
+        print(f"      {quarter}: {count:,} records")
     
     # Validate quarters
     df['quarter_valid'] = df['quarter'].apply(validate_quarter)
@@ -432,37 +432,19 @@ def clean_and_process_data(df):
     
     # Add year and age
     current_year = datetime.datetime.now().year
-    
-    # CRITICAL FIX: Fill missing years with median year from the dataset
-    missing_years = df['year'].isna().sum()
-    if missing_years > 0:
-        median_year = df['year'].median()
-        print(f"\n⚠️  Filling {missing_years} missing years with median: {median_year:.0f}")
-        df['year'] = df['year'].fillna(median_year)
-    
     df['age'] = current_year - df['year']
     df['decade'] = (df['year'] // 10) * 10
     
-    # CRITICAL FIX: Only require essential columns, fill optional ones
-    # Don't require 'year' since we just filled it
-    # Don't require 'bids' since BAT may have some null
-    required = ['manufacturer', 'model', 'quarter', 'price']
-    
-    print(f"\n🔍 Checking required columns: {required}")
+    # Required columns
+    required = ['manufacturer', 'model', 'year', 'quarter', 'price', 'views', 'bids']
     df = df.dropna(subset=required)
-    
-    # Fill optional columns with 0
-    df['views'] = df['views'].fillna(0)
-    df['bids'] = df['bids'].fillna(0)
-    df['comments'] = df['comments'].fillna(0)
     
     print(f"\n✅ Clean dataset ready:")
     print(f"   Records: {len(df):,}")
     print(f"   Manufacturers: {df['manufacturer'].nunique()}")
     print(f"   Models: {df['model'].nunique()}")
     print(f"   Quarters: {df['quarter'].nunique()}")
-    if len(df) > 0:
-        print(f"   Date range: {df['date'].min()} to {df['date'].max()}")
+    print(f"   Date range: {df['date'].min()} to {df['date'].max()}")
     
     return df
 
@@ -545,4 +527,167 @@ def calculate_mii_scores(df):
 
 def generate_insights(mii_results):
     """Generate insights and rankings"""
-    print("\n📊
+    print("\n📊 GENERATING INSIGHTS")
+    print("=" * 80)
+    
+    # Get latest quarter
+    latest_quarter = mii_results['quarter'].max()
+    print(f"\n📅 Latest quarter identified: {latest_quarter}")
+    
+    if pd.isna(latest_quarter):
+        print("❌ ERROR: No valid quarter found in MII results!")
+        print("\nAvailable quarters in dataset:")
+        print(mii_results['quarter'].value_counts())
+        raise Exception("Cannot generate insights without valid quarter data")
+    
+    latest_data = mii_results[mii_results['quarter'] == latest_quarter].copy()
+    print(f"   Records in latest quarter: {len(latest_data):,}")
+    
+    print(f"\n🏆 TOP 10 MODELS ({latest_quarter})")
+    print("-" * 80)
+    print(f"{'Rank':<6}{'Model':<30}{'MII':<9}{'Price':<12}{'Bids':<8}{'Views':<10}{'Year':<6}")
+    print("-" * 80)
+    
+    for i, row in latest_data.head(10).iterrows():
+        rank = latest_data.index.get_loc(i) + 1
+        model_name = row['model'][:28]
+        year = int(row['year']) if pd.notna(row['year']) else 'N/A'
+        price_str = f"${row['price']:,.0f}" if pd.notna(row['price']) else 'N/A'
+        print(f"{rank:<6}{model_name:<30}{row['mii_score']:<9.1f}{price_str:<12}"
+              f"{int(row['bids']):<8}{int(row['views']):<10,}{year:<6}")
+    
+    # Top manufacturers
+    print(f"\n\n🏭 TOP MANUFACTURERS BY AVERAGE MII ({latest_quarter})")
+    print("-" * 80)
+    manufacturer_stats = latest_data.groupby('manufacturer').agg({
+        'mii_score': 'mean',
+        'model': 'count',
+        'price': 'mean',
+        'views': 'sum'
+    }).round(2).sort_values('mii_score', ascending=False)
+    
+    print(f"{'Rank':<6}{'Manufacturer':<20}{'Avg MII':<11}{'Models':<9}{'Avg Price':<13}{'Views'}")
+    print("-" * 80)
+    
+    for idx, (manufacturer, row) in enumerate(manufacturer_stats.head(10).iterrows(), 1):
+        price_str = f"${row['price']:,.0f}"
+        print(f"{idx:<6}{manufacturer:<20}{row['mii_score']:<11.1f}"
+              f"{int(row['model']):<9}{price_str:<13}{int(row['views']):,}")
+    
+    # Price tiers
+    print(f"\n\n💎 TOP MODELS BY PRICE TIER ({latest_quarter})")
+    print("-" * 80)
+    
+    price_tiers = [
+        (0, 50000, "Under $50K"),
+        (50000, 100000, "$50K-$100K"),
+        (100000, 200000, "$100K-$200K"),
+        (200000, float('inf'), "$200K+")
+    ]
+    
+    for min_price, max_price, label in price_tiers:
+        tier_data = latest_data[
+            (latest_data['price'] >= min_price) & (latest_data['price'] < max_price)
+        ].head(3)
+        
+        if not tier_data.empty:
+            print(f"\n{label}:")
+            for _, row in tier_data.iterrows():
+                model_name = row['model'][:35]
+                price_str = f"${row['price']:,.0f}"
+                print(f"  • {model_name:<35} MII: {row['mii_score']:<6.1f} Price: {price_str}")
+    
+    # Decade analysis
+    if 'decade' in latest_data.columns:
+        print(f"\n\n📅 TOP MODELS BY DECADE ({latest_quarter})")
+        print("-" * 80)
+        
+        for decade in sorted(latest_data['decade'].dropna().unique(), reverse=True)[:5]:
+            decade_data = latest_data[latest_data['decade'] == decade].head(3)
+            if not decade_data.empty:
+                print(f"\n{int(decade)}s:")
+                for _, row in decade_data.iterrows():
+                    model_name = row['model'][:30]
+                    price_str = f"${row['price']:,.0f}"
+                    print(f"  • {model_name:<30} MII: {row['mii_score']:<6.1f} Price: {price_str}")
+    
+    # Data source breakdown
+    print(f"\n\n📈 DATA SOURCE BREAKDOWN")
+    print("-" * 80)
+    source_counts = mii_results['data_source'].value_counts()
+    for source, count in source_counts.items():
+        pct = (count / len(mii_results)) * 100
+        print(f"{source:<15} {count:>6,} records ({pct:>5.1f}%)")
+    
+    return latest_data
+
+def save_and_upload_results(mii_results, latest_data):
+    """Save results locally and upload to S3"""
+    print("\n\n💾 SAVING AND UPLOADING RESULTS")
+    print("=" * 80)
+    
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+    
+    # Save complete results
+    output_file = 'mii_results_latest.csv'
+    mii_results.to_csv(output_file, index=False)
+    print(f"✅ Saved: {output_file}")
+    
+    # Save top models
+    top_models_file = f'mii_top_models_{timestamp}.csv'
+    latest_data.head(50).to_csv(top_models_file, index=False)
+    print(f"✅ Saved: {top_models_file}")
+    
+    # Upload to S3
+    upload_to_s3(output_file, 'my-mii-reports')
+    upload_to_s3(top_models_file, 'my-mii-reports')
+    
+    print("\n✅ All results saved and uploaded!")
+
+def main():
+    """Main execution function"""
+    print("=" * 80)
+    print("🚀 MII Calculator with Manufacturer Name Cleanup")
+    print("   Engagement-Focused with Classic Car Bonus (Age Weight)")
+    if not USE_CNB_DATA:
+        print("   ⚠️  CNB DATA TEMPORARILY DISABLED - BAT DATA ONLY")
+    print("=" * 80)
+    print(f"⏰ Started at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    try:
+        # Load data
+        df = load_scraped_data()
+        
+        # Show manufacturer statistics
+        print("\n📊 MANUFACTURER STATISTICS AFTER CLEANUP")
+        print("=" * 80)
+        stats = get_manufacturer_stats(df, 'manufacturer')
+        print("\n🏆 Top 15 Manufacturers:")
+        for _, row in stats.head(15).iterrows():
+            print(f"   {row['Manufacturer']:<20} {int(row['Count']):>6,} ({row['Percentage']:>5.1f}%)")
+        
+        # Clean and process
+        df = clean_and_process_data(df)
+        
+        # Calculate MII
+        mii_results = calculate_mii_scores(df)
+        
+        # Generate insights
+        latest_data = generate_insights(mii_results)
+        
+        # Save results
+        save_and_upload_results(mii_results, latest_data)
+        
+        print(f"\n⏰ Completed at: {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 80)
+        
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
+    
+    return 0
+
+if __name__ == "__main__":
+    exit(main())
