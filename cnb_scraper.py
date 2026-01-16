@@ -94,10 +94,10 @@ print(f"Max auctions per run: {MAX_AUCTIONS_PER_RUN}")
 print(f"Sleep between auctions: {SLEEP_BETWEEN_AUCTIONS}s")
 
 def get_sitemap_urls():
-    """Get CNB auction URLs - OPTIMIZED FOR SPEED"""
-    print("Fetching CNB sitemap...")
-    
-    # METHOD 1: Direct requests (FAST - no browser needed)
+    """Get CNB auction URLs - BROWSER-BASED (sitemap is blocked)"""
+    print("Fetching CNB auction URLs...")
+
+    # METHOD 1: Try sitemap first (usually blocked but worth trying)
     try:
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -105,23 +105,23 @@ def get_sitemap_urls():
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive'
         }
-        
-        print("Trying main sitemap...")
+
+        print("Trying sitemap (may be blocked)...")
         sitemap_url = "https://carsandbids.com/sitemap.xml"
         response = requests.get(sitemap_url, headers=headers, timeout=15)
-        
+
         if response.status_code == 200:
             print(f"✓ Got main sitemap ({len(response.text)} chars)")
             soup = BeautifulSoup(response.text, "xml")
             locs = soup.find_all("loc")
-            
+
             # Find auctions sitemap
             auction_sitemap = None
             for loc in locs:
                 if "auctions" in loc.text.lower():
                     auction_sitemap = loc.text
                     break
-            
+
             if auction_sitemap:
                 print(f"✓ Found auctions sitemap: {auction_sitemap}")
                 response = requests.get(auction_sitemap, headers=headers, timeout=15)
@@ -130,57 +130,86 @@ def get_sitemap_urls():
                     soup = BeautifulSoup(response.text, "xml")
                     locs = soup.find_all("loc")
                     urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
-                    
+
                     if urls:
-                        print(f"✓ Found {len(urls)} auction URLs via sitemap (FAST METHOD)")
+                        print(f"✓ Found {len(urls)} auction URLs via sitemap")
                         return urls
-                    else:
-                        print("⚠ No auction URLs in sitemap")
+        else:
+            print(f"⚠ Sitemap returned {response.status_code}")
     except Exception as e:
-        print(f"✗ Sitemap method failed: {e}")
-    
-    # METHOD 2: Fallback to past auctions page (SLOWER - uses Playwright)
-    print("\nFalling back to past auctions page...")
+        print(f"⚠ Sitemap method failed: {e}")
+
+    # METHOD 2: Fallback to past auctions page (uses Playwright)
+    print("\nUsing Playwright to load past auctions page...")
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            
+            browser = p.chromium.launch(
+                headless=True,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-web-security",
+                    "--disable-features=VizDisplayCompositor"
+                ]
+            )
+            context = browser.new_context(
+                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            )
+            page = context.new_page()
+
             print("Loading past auctions page...")
-            page.goto("https://carsandbids.com/past-auctions/", timeout=60_000)
-            
+            page.goto("https://carsandbids.com/past-auctions/", timeout=60_000, wait_until="networkidle")
+
             print("Waiting for auction cards to appear...")
             try:
                 page.wait_for_selector("a[href*='/auctions/']", timeout=30_000)
                 print("✓ Auction links found")
             except:
                 print("⚠ Timeout waiting for links, trying anyway...")
-            
-            time.sleep(10)
-            
-            # Scroll to load more
-            for i in range(10):
-                page.evaluate("window.scrollBy(0, 1000)")
-                time.sleep(1)
-            
-            links = page.query_selector_all("a")
+
+            time.sleep(3)
+
+            # Scroll multiple times to load more auctions
+            print("Scrolling to load more auctions...")
+            prev_count = 0
+            for i in range(20):
+                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                time.sleep(1.5)
+
+                # Check if we've loaded more
+                links = page.query_selector_all("a[href*='/auctions/']")
+                curr_count = len(links)
+                if curr_count > prev_count:
+                    print(f"  Scroll {i+1}: {curr_count} links loaded")
+                    prev_count = curr_count
+                elif i > 5:
+                    # Stop if no new links after 5 attempts
+                    break
+
+            # Collect all auction URLs
+            links = page.query_selector_all("a[href*='/auctions/']")
             urls = set()
-            
+
             for link in links:
                 href = link.get_attribute("href")
-                if href and "/auctions/" in href and href != "/past-auctions/":
+                if href and "/auctions/" in href:
+                    # Skip non-auction pages
+                    if any(x in href for x in ['/past-auctions', '/live-auctions', '/search']):
+                        continue
                     if href.startswith("/"):
                         href = "https://carsandbids.com" + href
-                    urls.add(href)
-            
+                    # Only include actual auction URLs (should have a slug after /auctions/)
+                    if re.match(r'https://carsandbids\.com/auctions/[a-zA-Z0-9-]+', href):
+                        urls.add(href)
+
             browser.close()
-            
+
             urls = list(urls)
             print(f"✓ Found {len(urls)} auction URLs from past auctions page")
             return urls
-            
+
     except Exception as e:
-        print(f"✗ Past auctions failed: {e}")
+        print(f"✗ Past auctions page failed: {e}")
         traceback.print_exc()
         return []
 
@@ -222,8 +251,8 @@ def extract_number_from_text(text):
     return 0
 
 def extract_all_auction_data(page, auction_url):
-    """Extract comprehensive data from CNB auction page - FIXED BIDS EXTRACTION"""
-    
+    """Extract comprehensive data from CNB auction page - UPDATED SELECTORS"""
+
     data = {
         "model": "",
         "make": "",
@@ -241,99 +270,153 @@ def extract_all_auction_data(page, auction_url):
         "sale_date": "",
         "sale_type": "",
         "bids": 0,
-        "views": "",
+        "views": 0,
         "comments": 0,
         "seller": "",
         "auction_url": auction_url,
         "year": None,
         "scraped_date": datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     }
-    
+
     try:
         page.wait_for_selector("body", timeout=15000)
         time.sleep(2)
-        
+
+        # Extract title from .auction-title h1 or fallback to h1
         try:
-            title_element = page.query_selector("h1")
+            title_element = page.query_selector(".auction-title h1")
+            if not title_element:
+                title_element = page.query_selector("h1")
             if title_element:
                 data["model"] = clean_text(title_element.inner_text())
         except:
             pass
-        
+
+        # Extract year from URL or model text
         data["year"] = extract_year_from_url(auction_url)
         if not data["year"] and data["model"]:
             year_match = re.search(r'\b(19|20)\d{2}\b', data["model"])
             if year_match:
                 data["year"] = int(year_match.group(0))
-        
+
+        # Extract sale amount from .bid-value
         try:
-            bid_selectors = [
-                "span.bid-value",
-                ".bid-value",
-                ".final-bid",
-                ".current-bid"
-            ]
-            for selector in bid_selectors:
-                element = page.query_selector(selector)
-                if element:
-                    text = element.inner_text().strip()
-                    if text:
-                        data["sale_amount"] = text
-                        break
+            bid_element = page.query_selector(".bid-value")
+            if bid_element:
+                text = bid_element.inner_text().strip()
+                if text:
+                    data["sale_amount"] = text
         except:
             pass
-        
+
+        # Extract auction status and sale type from .current-bid.ended or #auction-jump
+        is_auction_ended = False
         try:
-            date_element = page.query_selector("span.time-ended") or page.query_selector(".auction-end-time")
-            if date_element:
-                data["sale_date"] = date_element.inner_text().strip()
-            
-            sale_type_element = page.query_selector("span.value")
-            if sale_type_element:
-                sale_text = sale_type_element.inner_text().lower()
-                if "sold" in sale_text:
-                    data["sale_type"] = "sold"
-                elif "reserve" in sale_text:
+            # Check for .ended class which indicates auction has ended
+            ended_element = page.query_selector(".current-bid.ended")
+            if ended_element:
+                is_auction_ended = True
+
+            # Check for reserve status
+            reserve_element = page.query_selector("#auction-jump h3 span")
+            if reserve_element:
+                reserve_text = reserve_element.inner_text().lower()
+                if "reserve" in reserve_text and "not met" in reserve_text:
                     data["sale_type"] = "reserve not met"
+                    is_auction_ended = True
+                elif "sold" in reserve_text:
+                    data["sale_type"] = "sold"
+                    is_auction_ended = True
                 else:
-                    data["sale_type"] = sale_text
+                    data["sale_type"] = reserve_text
+
+            # Check status header
+            status_container = page.query_selector(".current-bid.ended")
+            if status_container:
+                status_header = status_container.query_selector("h4")
+                if status_header:
+                    status_text = status_header.inner_text().lower()
+                    if "sold" in status_text:
+                        data["sale_type"] = "sold"
+                        is_auction_ended = True
+                    elif "bid to" in status_text:
+                        data["sale_type"] = "sold"
+                        is_auction_ended = True
+                    elif "reserve" in status_text:
+                        data["sale_type"] = "reserve not met"
+                        is_auction_ended = True
+                    elif not data["sale_type"]:
+                        data["sale_type"] = status_text
         except:
             pass
-        
-        # CRITICAL FIX: Extract bids as NUMBER, not year
+
+        # Store is_ended flag for later use
+        data["_is_ended"] = is_auction_ended
+
+        # Extract stats (bids, views, etc.) from ul.stats
         try:
-            bids_element = page.query_selector("li.num-bids")
-            if bids_element:
-                bids_text = bids_element.inner_text()
-                data["bids"] = extract_number_from_text(bids_text)
-        except Exception as e:
-            data["bids"] = 0
-        
-        try:
-            views_element = page.query_selector("li span.views")
-            if views_element:
-                views_text = views_element.inner_text()
-                data["views"] = extract_number_from_text(views_text)
+            stats_list = page.query_selector("ul.stats")
+            if stats_list:
+                stat_items = stats_list.query_selector_all("li:not(.seller)")
+                for item in stat_items:
+                    try:
+                        label_el = item.query_selector(".th")
+                        value_el = item.query_selector(".td")
+                        if label_el and value_el:
+                            label = label_el.inner_text().strip().lower()
+                            value_text = value_el.inner_text().strip()
+
+                            if "bid" in label:
+                                data["bids"] = extract_number_from_text(value_text)
+                            elif "view" in label:
+                                data["views"] = extract_number_from_text(value_text)
+                            elif "comment" in label:
+                                data["comments"] = extract_number_from_text(value_text)
+                    except:
+                        continue
         except:
             pass
-        
+
+        # Extract seller from li.seller .user
         try:
-            comments_element = page.query_selector(".comments-count") or page.query_selector(".comment-count")
-            if comments_element:
-                comments_text = comments_element.inner_text()
-                data["comments"] = extract_number_from_text(comments_text)
-        except:
-            pass
-        
-        try:
-            seller_element = page.query_selector("li.seller")
+            seller_element = page.query_selector("li.seller .user")
             if seller_element:
                 data["seller"] = clean_text(seller_element.inner_text())
+            else:
+                # Fallback to just li.seller
+                seller_element = page.query_selector("li.seller")
+                if seller_element:
+                    data["seller"] = clean_text(seller_element.inner_text())
         except:
             pass
-        
+
+        # Extract date from auction end info
         try:
-            fact_containers = page.query_selector_all("dl")
+            # Try to get date from the status container
+            status_container = page.query_selector(".current-bid.ended")
+            if status_container:
+                # Look for date text pattern in the container
+                full_text = status_container.inner_text()
+                date_match = re.search(r'(\d{1,2}/\d{1,2}/\d{2,4}|\w+\s+\d{1,2},?\s+\d{4})', full_text)
+                if date_match:
+                    data["sale_date"] = date_match.group(1)
+
+            # Also check for time-ended class
+            if not data["sale_date"]:
+                date_element = page.query_selector(".time-ended, .auction-end-time")
+                if date_element:
+                    data["sale_date"] = date_element.inner_text().strip()
+        except:
+            pass
+
+        # Extract quick facts from .quick-facts dl
+        try:
+            quick_facts = page.query_selector(".quick-facts")
+            if quick_facts:
+                fact_containers = quick_facts.query_selector_all("dl")
+            else:
+                fact_containers = page.query_selector_all("dl")
+
             for container in fact_containers:
                 dt_elements = container.query_selector_all("dt")
                 for dt in dt_elements:
@@ -371,28 +454,37 @@ def extract_all_auction_data(page, auction_url):
                         continue
         except Exception as e:
             pass
-        
+
+        # Auto-detect make from model if not found
         if not data["make"] and data["model"]:
             model_words = data["model"].split()
             if len(model_words) > 0:
-                common_makes = ['Toyota', 'Honda', 'Ford', 'Chevrolet', 'BMW', 'Mercedes', 
+                common_makes = ['Toyota', 'Honda', 'Ford', 'Chevrolet', 'BMW', 'Mercedes',
                                'Audi', 'Volkswagen', 'Nissan', 'Mazda', 'Porsche', 'Ferrari',
-                               'Lamborghini', 'McLaren']
+                               'Lamborghini', 'McLaren', 'Lexus', 'Acura', 'Infiniti', 'Jaguar',
+                               'Land', 'Range', 'Rover', 'Jeep', 'Dodge', 'Ram', 'Chrysler',
+                               'Buick', 'Cadillac', 'GMC', 'Lincoln', 'Volvo', 'Saab', 'Subaru',
+                               'Mitsubishi', 'Hyundai', 'Kia', 'Genesis', 'Alfa', 'Fiat', 'Maserati',
+                               'Bentley', 'Rolls', 'Royce', 'Aston', 'Martin', 'Lotus', 'Tesla']
                 for word in model_words:
                     if any(make.lower() == word.lower() for make in common_makes):
                         data["make"] = word
                         break
-        
+
         # VALIDATION: Ensure bids is not a year
         if data["bids"] >= 1900 and data["bids"] <= 2030:
             print(f"    ⚠ WARNING: Bids value {data['bids']} looks like a year! Setting to 0.")
             data["bids"] = 0
-        
+
+        # Set sale_date to scraped_date if auction has ended but no date found
+        if data["sale_type"] and not data["sale_date"]:
+            data["sale_date"] = data["scraped_date"].split()[0]  # Just the date part
+
         print(f"    ✓ {data['model'][:40] if data['model'] else 'Unknown'}... | "
               f"${data['sale_amount']} | {data['views']} views | {data['bids']} bids | Year: {data['year']}")
-        
+
         return data
-        
+
     except Exception as e:
         print(f"    ✗ Extraction error: {str(e)[:100]}")
         return data
@@ -456,12 +548,14 @@ def main():
                         time.sleep(5)
                 
                 data = extract_all_auction_data(page, auction_url)
-                
-                if not data['sale_date'] or data['sale_date'].strip() == "":
+
+                # Check if auction has ended using the flag
+                is_ended = data.pop('_is_ended', False)
+                if not is_ended and not data['sale_type']:
                     print(f"  ⊘ Skipping - auction in progress")
                     skipped_in_progress += 1
                     continue
-                
+
                 if data['model'] or data['views'] or data['bids']:
                     new_rows.append(data)
                     successful += 1
