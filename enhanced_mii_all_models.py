@@ -6,11 +6,17 @@ import os
 import boto3
 from botocore.exceptions import NoCredentialsError
 from manufacturer_cleanup import clean_manufacturer_column, get_manufacturer_stats
+from social_metrics import collect_social_metrics_for_mii, SocialMetricsCollector
 
 # ============================================================================
-# CONFIGURATION: Set to False to temporarily disable CNB data
+# CONFIGURATION
 # ============================================================================
 USE_CNB_DATA = False  # Set to True when CNB scraper is fixed
+
+# Social Metrics Configuration
+USE_SOCIAL_METRICS = True  # Set to True to collect real social metrics
+SOCIAL_METRICS_SAMPLE = None  # Set to a number to limit models (for testing), None for all
+YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')  # Optional: Set for real YouTube data
 # ============================================================================
 
 def upload_to_s3(file_name, bucket, object_name=None):
@@ -452,7 +458,7 @@ def calculate_mii_scores(df):
     """Calculate MII scores for each model/quarter combination"""
     print("\n📊 CALCULATING MII SCORES")
     print("=" * 80)
-    
+
     # Group by manufacturer, model, and quarter
     grouped = df.groupby(['manufacturer', 'model', 'quarter']).agg({
         'price': 'mean',
@@ -465,19 +471,67 @@ def calculate_mii_scores(df):
         'sold': 'sum',
         'data_source': 'first'
     }).reset_index()
-    
+
     print(f"✅ Created {len(grouped):,} model-quarter combinations")
-    
-    # Get Instagram estimates
-    print(f"🔍 Estimating Instagram followers for {grouped['model'].nunique()} unique models...")
-    instagram_estimates = get_instagram_estimates(grouped['model'].unique())
-    grouped['instagram_followers'] = grouped['model'].map(instagram_estimates)
-    
+
+    # Collect social metrics (Google Trends + YouTube)
+    if USE_SOCIAL_METRICS:
+        print(f"\n🌐 Collecting social metrics for {grouped['model'].nunique()} unique models...")
+        try:
+            social_df = collect_social_metrics_for_mii(
+                grouped[['manufacturer', 'model']].drop_duplicates(),
+                youtube_api_key=YOUTUBE_API_KEY,
+                sample_size=SOCIAL_METRICS_SAMPLE
+            )
+
+            # Merge social metrics with grouped data
+            grouped = grouped.merge(
+                social_df[['manufacturer', 'model', 'google_trends_interest',
+                          'youtube_total_views', 'social_score', 'google_trends_direction']],
+                on=['manufacturer', 'model'],
+                how='left'
+            )
+
+            # Fill NaN with fallback estimates
+            grouped['google_trends_interest'] = grouped['google_trends_interest'].fillna(30)
+            grouped['youtube_total_views'] = grouped['youtube_total_views'].fillna(10000)
+            grouped['social_score'] = grouped['social_score'].fillna(25)
+
+            print(f"✅ Social metrics collected and merged")
+            print(f"   Google Trends range: {grouped['google_trends_interest'].min():.1f} - {grouped['google_trends_interest'].max():.1f}")
+            print(f"   YouTube views range: {grouped['youtube_total_views'].min():,.0f} - {grouped['youtube_total_views'].max():,.0f}")
+            print(f"   Social score range: {grouped['social_score'].min():.1f} - {grouped['social_score'].max():.1f}")
+
+            use_social = True
+        except Exception as e:
+            print(f"⚠️  Social metrics collection failed: {e}")
+            print("   Falling back to Instagram estimates")
+            use_social = False
+    else:
+        print("⏭️  Social metrics disabled, using Instagram estimates")
+        use_social = False
+
+    # Fallback to Instagram estimates if social metrics failed or disabled
+    if not use_social:
+        print(f"🔍 Estimating Instagram followers for {grouped['model'].nunique()} unique models...")
+        instagram_estimates = get_instagram_estimates(grouped['model'].unique())
+        grouped['instagram_followers'] = grouped['model'].map(instagram_estimates)
+        grouped['google_trends_interest'] = 0
+        grouped['youtube_total_views'] = 0
+        grouped['social_score'] = 0
+
     # Normalize within each quarter
     for quarter in grouped['quarter'].unique():
         quarter_mask = grouped['quarter'] == quarter
-        
-        for metric in ['views', 'bids', 'comments', 'price', 'instagram_followers']:
+
+        # Metrics to normalize
+        if use_social:
+            metrics_to_normalize = ['views', 'bids', 'comments', 'price',
+                                   'google_trends_interest', 'youtube_total_views', 'social_score']
+        else:
+            metrics_to_normalize = ['views', 'bids', 'comments', 'price', 'instagram_followers']
+
+        for metric in metrics_to_normalize:
             if metric in grouped.columns:
                 max_val = grouped.loc[quarter_mask, metric].max()
                 if max_val > 0:
@@ -485,7 +539,7 @@ def calculate_mii_scores(df):
                         grouped.loc[quarter_mask, metric] / max_val
                 else:
                     grouped.loc[quarter_mask, f'{metric}_normalized'] = 0
-        
+
         # Normalize age
         if 'age' in grouped.columns:
             max_age = grouped.loc[quarter_mask, 'age'].max()
@@ -494,35 +548,59 @@ def calculate_mii_scores(df):
                     grouped.loc[quarter_mask, 'age'] / max_age
             else:
                 grouped.loc[quarter_mask, 'age_normalized'] = 0
-    
-    # Calculate MII score
-    weights = {
-        'price_normalized': 0.25,
-        'bids_normalized': 0.25,
-        'views_normalized': 0.20,
-        'comments_normalized': 0.15,
-        'instagram_followers_normalized': 0.10,
-        'age_normalized': 0.05
-    }
-    
+
+    # Calculate MII score with updated weights
+    if use_social:
+        # New weights with Google Trends and YouTube
+        weights = {
+            'price_normalized': 0.20,           # 20% - Sale price
+            'bids_normalized': 0.20,            # 20% - Auction engagement
+            'views_normalized': 0.15,           # 15% - Page views
+            'comments_normalized': 0.10,        # 10% - Comments
+            'google_trends_interest_normalized': 0.15,  # 15% - Google Trends
+            'youtube_total_views_normalized': 0.10,     # 10% - YouTube views
+            'social_score_normalized': 0.05,    # 5% - Combined social score
+            'age_normalized': 0.05              # 5% - Classic car bonus
+        }
+        weight_desc = """
+   Price:              20%
+   Bids:               20%
+   Views:              15%
+   Comments:           10%
+   Google Trends:      15%
+   YouTube Views:      10%
+   Social Score:        5%
+   Age (classic):       5%"""
+    else:
+        # Legacy weights without social metrics
+        weights = {
+            'price_normalized': 0.25,
+            'bids_normalized': 0.25,
+            'views_normalized': 0.20,
+            'comments_normalized': 0.15,
+            'instagram_followers_normalized': 0.10,
+            'age_normalized': 0.05
+        }
+        weight_desc = """
+   Price:          25%
+   Bids:           25%
+   Views:          20%
+   Comments:       15%
+   Instagram:      10%
+   Age (classic):   5%"""
+
     grouped['mii_score'] = sum(
-        grouped[metric] * weight 
-        for metric, weight in weights.items() 
+        grouped[metric] * weight
+        for metric, weight in weights.items()
         if metric in grouped.columns
     ) * 100
-    
+
     grouped['mii_score'] = grouped['mii_score'].round(2)
     grouped = grouped.sort_values('mii_score', ascending=False)
-    
+
     print(f"✅ Calculated MII for {len(grouped)} model-quarter combinations")
-    print(f"\n💯 MII Score Composition:")
-    print(f"   Price:          25%")
-    print(f"   Bids:           25%")
-    print(f"   Views:          20%")
-    print(f"   Comments:       15%")
-    print(f"   Instagram:      10%")
-    print(f"   Age (classic):   5%")
-    
+    print(f"\n💯 MII Score Composition:{weight_desc}")
+
     return grouped
 
 def generate_insights(mii_results):
