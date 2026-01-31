@@ -59,22 +59,25 @@ def extract_year_from_url(url):
     """Extract year from BAT URL pattern"""
     if not url:
         return None
-    
+
     try:
+        # Allow years up to 5 years in the future (for upcoming model years)
+        max_year = datetime.datetime.now().year + 5
+
         # Primary pattern: /listing/YYYY-make-model/
         match = re.search(r'/listing/(\d{4})-', url)
         if match:
             year = int(match.group(1))
-            if 1900 <= year <= 2030:
+            if 1900 <= year <= max_year:
                 return year
-        
+
         # Secondary pattern: look for YYYY in the URL path after listing/
         match = re.search(r'/listing/[^/]*?(\d{4})', url)
         if match:
             year = int(match.group(1))
-            if 1900 <= year <= 2030:
+            if 1900 <= year <= max_year:
                 return year
-        
+
         return None
     except Exception as e:
         print(f"Error extracting year from URL {url}: {e}")
@@ -84,29 +87,32 @@ def extract_year_from_title(title):
     """Extract year from title"""
     if not title:
         return None
-    
+
     try:
+        # Allow years up to 5 years in the future (for upcoming model years)
+        max_year = datetime.datetime.now().year + 5
+
         # Pattern 1: Year at start "2007 Mercedes-Benz"
         match = re.search(r'^(\d{4})\s+', title)
         if match:
             year = int(match.group(1))
-            if 1900 <= year <= 2030:
+            if 1900 <= year <= max_year:
                 return year
-        
+
         # Pattern 2: Year in parentheses "(2007)"
         match = re.search(r'\((\d{4})\)', title)
         if match:
             year = int(match.group(1))
-            if 1900 <= year <= 2030:
+            if 1900 <= year <= max_year:
                 return year
-        
+
         # Pattern 3: Any 4-digit year in title
         match = re.search(r'\b(\d{4})\b', title)
         if match:
             year = int(match.group(1))
-            if 1900 <= year <= 2030:
+            if 1900 <= year <= max_year:
                 return year
-                
+
         return None
     except Exception as e:
         print(f"Error extracting year from title {title}: {e}")
