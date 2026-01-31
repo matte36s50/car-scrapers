@@ -217,21 +217,18 @@ def extract_year_from_url(url):
     """Extract year from CNB URL patterns"""
     if not url:
         return None
-
-    # Allow years up to 5 years in the future (for upcoming model years)
-    max_year = datetime.datetime.now().year + 5
-
+    
     patterns = [
         r'/auctions/[^/]*-(\d{4})-',
         r'/auctions/(\d{4})-',
         r'-(\d{4})-'
     ]
-
+    
     for pattern in patterns:
         match = re.search(pattern, url)
         if match:
             year = int(match.group(1))
-            if 1900 <= year <= max_year:
+            if 1900 <= year <= 2030:
                 return year
     return None
 
@@ -474,9 +471,8 @@ def extract_all_auction_data(page, auction_url):
                         data["make"] = word
                         break
 
-        # VALIDATION: Ensure bids is not a year (allow up to 5 years in future)
-        max_year = datetime.datetime.now().year + 5
-        if data["bids"] >= 1900 and data["bids"] <= max_year:
+        # VALIDATION: Ensure bids is not a year
+        if data["bids"] >= 1900 and data["bids"] <= 2030:
             print(f"    ⚠ WARNING: Bids value {data['bids']} looks like a year! Setting to 0.")
             data["bids"] = 0
 
@@ -610,12 +606,11 @@ def main():
         if pd.notna(updated_df['year']).any():
             print(f"   Years: {updated_df['year'].min():.0f}-{updated_df['year'].max():.0f}")
         
-        # Validate bids (allow years up to 5 years in future)
-        max_year = datetime.datetime.now().year + 5
-        bad_bids = updated_df[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= max_year)]
+        # Validate bids
+        bad_bids = updated_df[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= 2030)]
         if len(bad_bids) > 0:
             print(f"\n⚠  WARNING: {len(bad_bids)} entries with suspicious bids, fixing...")
-            updated_df.loc[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= max_year), 'bids'] = 0
+            updated_df.loc[(updated_df['bids'] >= 1900) & (updated_df['bids'] <= 2030), 'bids'] = 0
         
         if upload_updated_cnb_csv(updated_df):
             print(f"\n✅ Successfully updated cnb.csv in S3!")
