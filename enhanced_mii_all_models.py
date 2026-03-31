@@ -417,7 +417,7 @@ def clean_and_process_data(df):
         raise Exception("❌ CRITICAL ERROR: No valid dates found! Cannot create quarters.")
     
     # Create quarter only for rows with valid dates
-    df['quarter'] = df['date'].dt.to_period('Q').astype(str)
+    df['quarter'] = df['date'].dt.to_period('M').astype(str)
     
     # Show quarter distribution
     print(f"\n📊 Quarter distribution:")
