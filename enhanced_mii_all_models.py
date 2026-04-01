@@ -399,7 +399,6 @@ def clean_and_process_data(df):
     
     # Filter: Only sold auctions with valid prices
     df = df[
-        (df['sold'] == 1) & 
         (df['price'].notna()) & 
         (df['price'] > 100) &
         (df['price'] < 10_000_000)
