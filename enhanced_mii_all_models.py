@@ -459,17 +459,19 @@ def calculate_mii_scores(df):
     print("=" * 80)
 
     # Group by manufacturer, model, and quarter
-    grouped = df.groupby(['manufacturer', 'model', 'quarter']).agg({
-        'price': 'mean',
-        'views': 'mean',
-        'bids': 'mean',
-        'comments': 'mean',
-        'year': 'mean',
-        'age': 'mean',
-        'decade': 'first',
-        'sold': 'sum',
-        'data_source': 'first'
-    }).reset_index()
+ grouped = df.groupby(['manufacturer', 'model', 'quarter']).agg(
+    price=('price', 'mean'),
+    views=('views', 'mean'),
+    bids=('bids', 'mean'),
+    comments=('comments', 'mean'),
+    year=('year', 'mean'),
+    age=('age', 'mean'),
+    decade=('decade', 'first'),
+    sold=('sold', 'sum'),
+    data_source=('data_source', 'first'),
+    auction_count=('price', 'count'),
+).reset_index()
+
 
     print(f"✅ Created {len(grouped):,} model-quarter combinations")
 
