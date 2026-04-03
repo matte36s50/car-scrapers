@@ -53,13 +53,19 @@ class SocialMetricsCache:
         return hashlib.md5(f"{source}:{query}:{month}".encode()).hexdigest()
 
     def get(self, source: str, query: str, month: str) -> Optional[dict]:
-        """Get cached value if exists and not expired (30 days)"""
+        """Get cached value if exists and not expired.
+
+        TTL is 7 days for actively trending models (trend_direction == 'up'),
+        30 days otherwise.
+        """
         key = self._get_cache_key(source, query, month)
         if key in self.cache:
             entry = self.cache[key]
             cached_time = datetime.fromisoformat(entry.get('cached_at', '2000-01-01'))
-            if datetime.now() - cached_time < timedelta(days=30):
-                return entry.get('data')
+            data = entry.get('data', {})
+            ttl = timedelta(days=7) if data.get('trend_direction') == 'up' else timedelta(days=30)
+            if datetime.now() - cached_time < ttl:
+                return data
         return None
 
     def set(self, source: str, query: str, month: str, data: dict):
@@ -250,7 +256,7 @@ class YouTubeCollector:
         self,
         make: str,
         model: str,
-        max_results: int = 10
+        max_results: int = 50
     ) -> dict:
         """
         Get YouTube video metrics for a car make/model.
@@ -261,7 +267,7 @@ class YouTubeCollector:
         if not self.youtube:
             return self._get_fallback_estimate(make, model)
 
-        query = f"{make} {model} review".strip()
+        query = f"{make} {model}".strip()
         current_month = datetime.now().strftime("%Y-%m")
 
         # Check cache first
@@ -491,10 +497,12 @@ class SocialMetricsCollector:
                 'google_trends_peak': metrics['google_trends'].get('peak_interest', 0),
                 'google_trends_direction': metrics['google_trends'].get('trend_direction', 'unknown'),
                 'google_trends_pct': metrics['google_trends'].get('trend_pct', 0),
+                'google_trends_source': metrics['google_trends'].get('source', 'unknown'),
                 'youtube_videos': metrics['youtube'].get('total_videos', 0),
                 'youtube_total_views': metrics['youtube'].get('total_views', 0),
                 'youtube_avg_views': metrics['youtube'].get('avg_views', 0),
                 'youtube_recent': metrics['youtube'].get('recent_uploads', 0),
+                'youtube_source': metrics['youtube'].get('source', 'unknown'),
                 'social_score': metrics['combined_score'],
                 'collected_at': metrics['collected_at']
             }

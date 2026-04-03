@@ -488,14 +488,19 @@ def calculate_mii_scores(df):
             # Merge social metrics with grouped data
             grouped = grouped.merge(
                 social_df[['manufacturer', 'model', 'google_trends_interest',
-                          'youtube_total_views', 'social_score', 'google_trends_direction']],
+                          'google_trends_pct', 'google_trends_direction',
+                          'google_trends_source', 'youtube_total_views',
+                          'youtube_source', 'social_score']],
                 on=['manufacturer', 'model'],
                 how='left'
             )
 
             # Fill NaN with fallback estimates
             grouped['google_trends_interest'] = grouped['google_trends_interest'].fillna(30)
+            grouped['google_trends_pct'] = grouped['google_trends_pct'].fillna(0)
+            grouped['google_trends_source'] = grouped['google_trends_source'].fillna('estimate')
             grouped['youtube_total_views'] = grouped['youtube_total_views'].fillna(10000)
+            grouped['youtube_source'] = grouped['youtube_source'].fillna('estimate')
             grouped['social_score'] = grouped['social_score'].fillna(25)
 
             print(f"✅ Social metrics collected and merged")
