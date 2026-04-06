@@ -493,26 +493,33 @@ def extract_all_auction_data(page, auction_url):
         print(f"    ✗ Extraction error: {str(e)[:100]}")
         return data
 
-def main():
+def main(start_date=None, end_date=None, max_auctions=None):
     print(f"Starting CNB Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
+    effective_max = max_auctions if max_auctions is not None else MAX_AUCTIONS_PER_RUN
+    is_backfill = bool(start_date or end_date)
+    if is_backfill:
+        print(f"[BACKFILL MODE] Date range: {start_date or 'unset'} → {end_date or 'unset'}")
+    start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    end_dt   = datetime.datetime.strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
+
     existing_df, existing_urls = download_existing_cnb_csv()
-    
+
     all_urls = get_sitemap_urls()
-    
+
     if not all_urls:
         print("✗ Failed to get sitemap URLs!")
         return False
-    
+
     new_urls = [url for url in all_urls if url not in existing_urls]
     print(f"Found {len(new_urls)} new auctions to scrape")
-    
+
     if not new_urls:
         print("✓ No new auctions found - cnb.csv is up to date!")
         return True
-    
-    new_urls = new_urls[:MAX_AUCTIONS_PER_RUN]
-    print(f"Processing {len(new_urls)} new auctions (max {MAX_AUCTIONS_PER_RUN} per run)")
+
+    new_urls = new_urls[:effective_max]
+    print(f"Processing {len(new_urls)} new auctions (max {effective_max} per run)")
     
     new_rows = []
     
@@ -533,6 +540,7 @@ def main():
         successful = 0
         failed = 0
         skipped_in_progress = 0
+        consecutive_too_old = 0
         
         for i, auction_url in enumerate(new_urls):
             print(f"\n[{i+1}/{len(new_urls)}] {auction_url}")
@@ -555,6 +563,33 @@ def main():
 
                 # Check if auction has ended using the flag
                 is_ended = data.pop('_is_ended', False)
+
+                # Backfill date-range enforcement
+                if is_backfill and data.get('sale_date'):
+                    try:
+                        auction_dt = None
+                        for fmt in ("%m/%d/%y", "%m/%d/%Y", "%B %d, %Y", "%b %d, %Y"):
+                            try:
+                                auction_dt = datetime.datetime.strptime(data['sale_date'].strip(), fmt).date()
+                                break
+                            except ValueError:
+                                continue
+                        if auction_dt:
+                            if end_dt and auction_dt > end_dt:
+                                print(f"  [BACKFILL] Skipping {auction_dt} — after end_date {end_dt}")
+                                continue
+                            if start_dt and auction_dt < start_dt:
+                                consecutive_too_old += 1
+                                print(f"  [BACKFILL] Skipping {auction_dt} — before start_date {start_dt} ({consecutive_too_old}/10)")
+                                if consecutive_too_old >= 10:
+                                    print("  [BACKFILL] 10 consecutive out-of-range — stopping early")
+                                    break
+                                continue
+                            else:
+                                consecutive_too_old = 0
+                    except Exception as date_err:
+                        print(f"  [BACKFILL] Could not parse sale_date '{data.get('sale_date')}': {date_err}")
+
                 if not is_ended and not data['sale_type']:
                     print(f"  ⊘ Skipping - auction in progress")
                     skipped_in_progress += 1
@@ -628,8 +663,17 @@ def main():
         return True
 
 if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Cars & Bids Auction Scraper")
+    parser.add_argument("--start-date", metavar="YYYY-MM-DD", default=None,
+                        help="Only collect auctions ending on or after this date (backfill mode)")
+    parser.add_argument("--end-date", metavar="YYYY-MM-DD", default=None,
+                        help="Only collect auctions ending on or before this date (backfill mode)")
+    parser.add_argument("--max-auctions", type=int, default=None,
+                        help=f"Max auctions per run (overrides MAX_AUCTIONS_PER_RUN, default: {MAX_AUCTIONS_PER_RUN})")
+    args = parser.parse_args()
     try:
-        success = main()
+        success = main(start_date=args.start_date, end_date=args.end_date, max_auctions=args.max_auctions)
         exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Fatal error: {e}")

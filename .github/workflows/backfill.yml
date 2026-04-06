@@ -1,0 +1,87 @@
+name: Backfill Auction Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Start date for backfill (YYYY-MM-DD)'
+        required: true
+        type: string
+      end_date:
+        description: 'End date for backfill (YYYY-MM-DD)'
+        required: true
+        type: string
+      source:
+        description: 'Which scraper(s) to run'
+        required: true
+        type: choice
+        options:
+          - both
+          - bat
+          - cnb
+        default: both
+      max_auctions:
+        description: 'Max auctions per scraper (leave blank for scraper defaults)'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  backfill:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 360
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Cache Playwright browsers
+      uses: actions/cache@v3
+      id: playwright-cache
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright-chromium-1091
+        restore-keys: |
+          ${{ runner.os }}-playwright-
+
+    - run: pip install -r requirements.txt
+
+    - name: Install Playwright browsers
+      if: steps.playwright-cache.outputs.cache-hit != 'true'
+      run: playwright install chromium
+
+    - name: Install Playwright deps (cached)
+      if: steps.playwright-cache.outputs.cache-hit == 'true'
+      run: playwright install-deps chromium
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Build CLI args
+      id: args
+      run: |
+        A="--start-date ${{ github.event.inputs.start_date }} --end-date ${{ github.event.inputs.end_date }}"
+        [ -n "${{ github.event.inputs.max_auctions }}" ] && A="$A --max-auctions ${{ github.event.inputs.max_auctions }}"
+        echo "cli=$A" >> $GITHUB_OUTPUT
+
+    - name: Run BAT scraper
+      if: ${{ github.event.inputs.source == 'bat' || github.event.inputs.source == 'both' }}
+      run: python bat_scraper.py ${{ steps.args.outputs.cli }}
+      continue-on-error: true
+
+    - name: Run CNB scraper
+      if: ${{ github.event.inputs.source == 'cnb' || github.event.inputs.source == 'both' }}
+      run: python cnb_scraper.py ${{ steps.args.outputs.cli }}
+      continue-on-error: true
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "Backfill complete: ${{ github.event.inputs.source }} | ${{ github.event.inputs.start_date }} → ${{ github.event.inputs.end_date }}"
