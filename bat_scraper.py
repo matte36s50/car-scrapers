@@ -256,22 +256,23 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         btn.scroll_into_view_if_needed()
         page.wait_for_timeout(1000)
         btn.click()
-        
-        try:
-            page.wait_for_function(
-                "([sel, n]) => document.querySelectorAll(sel).length > n",
-                arg=[SELECTORS["tile"], loaded],
-                timeout=20_000
-            )
-            print(f"Successfully loaded more listings")
-        except Exception as e:
-            print(f"Timeout waiting for more listings: {e}")
-            page.wait_for_timeout(3000)
-            new_cards = page.query_selector_all(SELECTORS["tile"])
-            if len(new_cards) > current:
-                print(f"Found {len(new_cards) - current} additional listings after timeout")
-                continue
-            else:
+
+        # Poll for new cards rather than using wait_for_function (avoids
+        # Playwright list-arg serialization bug: 'dict' has no attr '_object')
+        deadline = 20_000  # ms
+        poll_interval = 500  # ms
+        elapsed = 0
+        new_count = loaded
+        while elapsed < deadline:
+            page.wait_for_timeout(poll_interval)
+            elapsed += poll_interval
+            new_count = len(page.query_selector_all(SELECTORS["tile"]))
+            if new_count > loaded:
+                print(f"Successfully loaded more listings")
+                break
+        else:
+            print(f"Timeout waiting for more listings after {deadline}ms")
+            if new_count <= loaded:
                 print("No additional listings found - stopping collection")
                 break
 
