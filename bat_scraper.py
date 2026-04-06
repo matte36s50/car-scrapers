@@ -41,7 +41,7 @@ def download_existing_bat_csv():
         print(f"Downloaded existing bat.csv from S3")
         
         # Load existing data
-        existing_df = pd.read_csv('existing_bat.csv')
+        existing_df = pd.read_csv('existing_bat.csv', low_memory=False)
         print(f"Found {len(existing_df)} existing rows")
         
         # Get existing URLs to avoid duplicates
