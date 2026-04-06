@@ -219,8 +219,9 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
     max_failures = 3
 
     while loaded < max_auctions:
-        cards = page.query_selector_all(SELECTORS["tile"])
-        current = len(cards)
+        current = page.eval_on_selector_all(
+            SELECTORS["tile"], "els => els.length"
+        )
         print(f"Loaded {current}/{max_auctions} listings")
 
         # If no new cards loaded, we might be at the end
@@ -233,8 +234,13 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         else:
             consecutive_failures = 0
 
-        for card in cards[loaded: min(current, max_auctions)]:
-            href = card.get_attribute("href")
+        # Extract hrefs via JS to avoid stale ElementHandle serialization errors
+        batch_limit = min(current, max_auctions)
+        new_hrefs = page.eval_on_selector_all(
+            SELECTORS["tile"],
+            f"els => els.slice({loaded}, {batch_limit}).map(el => el.getAttribute('href'))"
+        )
+        for href in new_hrefs:
             if href:
                 urls.append(href if href.startswith("http") else BASE_URL + href)
 
