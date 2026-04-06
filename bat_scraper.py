@@ -41,7 +41,7 @@ def download_existing_bat_csv():
         print(f"Downloaded existing bat.csv from S3")
         
         # Load existing data
-        existing_df = pd.read_csv('existing_bat.csv')
+        existing_df = pd.read_csv('existing_bat.csv', low_memory=False)
         print(f"Found {len(existing_df)} existing rows")
         
         # Get existing URLs to avoid duplicates
@@ -219,8 +219,9 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
     max_failures = 3
 
     while loaded < max_auctions:
-        cards = page.query_selector_all(SELECTORS["tile"])
-        current = len(cards)
+        current = page.eval_on_selector_all(
+            SELECTORS["tile"], "els => els.length"
+        )
         print(f"Loaded {current}/{max_auctions} listings")
 
         # If no new cards loaded, we might be at the end
@@ -233,8 +234,13 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         else:
             consecutive_failures = 0
 
-        for card in cards[loaded: min(current, max_auctions)]:
-            href = card.get_attribute("href")
+        # Extract hrefs via JS to avoid stale ElementHandle serialization errors
+        batch_limit = min(current, max_auctions)
+        new_hrefs = page.eval_on_selector_all(
+            SELECTORS["tile"],
+            f"els => els.slice({loaded}, {batch_limit}).map(el => el.getAttribute('href'))"
+        )
+        for href in new_hrefs:
             if href:
                 urls.append(href if href.startswith("http") else BASE_URL + href)
 
@@ -256,22 +262,23 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         btn.scroll_into_view_if_needed()
         page.wait_for_timeout(1000)
         btn.click()
-        
-        try:
-            page.wait_for_function(
-                "([sel, n]) => document.querySelectorAll(sel).length > n",
-                arg=[SELECTORS["tile"], loaded],
-                timeout=20_000
-            )
-            print(f"Successfully loaded more listings")
-        except Exception as e:
-            print(f"Timeout waiting for more listings: {e}")
-            page.wait_for_timeout(3000)
-            new_cards = page.query_selector_all(SELECTORS["tile"])
-            if len(new_cards) > current:
-                print(f"Found {len(new_cards) - current} additional listings after timeout")
-                continue
-            else:
+
+        # Poll for new cards rather than using wait_for_function (avoids
+        # Playwright list-arg serialization bug: 'dict' has no attr '_object')
+        deadline = 20_000  # ms
+        poll_interval = 500  # ms
+        elapsed = 0
+        new_count = loaded
+        while elapsed < deadline:
+            page.wait_for_timeout(poll_interval)
+            elapsed += poll_interval
+            new_count = len(page.query_selector_all(SELECTORS["tile"]))
+            if new_count > loaded:
+                print(f"Successfully loaded more listings")
+                break
+        else:
+            print(f"Timeout waiting for more listings after {deadline}ms")
+            if new_count <= loaded:
                 print("No additional listings found - stopping collection")
                 break
 
