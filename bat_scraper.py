@@ -204,24 +204,24 @@ SELECTORS = {
     "group_items": "div.group-item-wrap > div.group-item",
 }
 
-def collect_auction_urls(page):
+def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTIONS):
     """Collect auction URLs from results page"""
-    print(f"\n[4/8] Navigating to results page: {RESULTS_URL}")
-    page.goto(RESULTS_URL, timeout=60_000)
+    print(f"\n[4/8] Navigating to results page: {results_url}")
+    page.goto(results_url, timeout=60_000)
     print("Page loaded successfully")
-    
+
     print(f"Waiting for auction tiles selector: {SELECTORS['tile']}")
     page.wait_for_selector(SELECTORS["tile"])
     print("Auction tiles found")
-    
+
     urls, loaded = [], 0
     consecutive_failures = 0
     max_failures = 3
 
-    while loaded < MAX_AUCTIONS:
+    while loaded < max_auctions:
         cards = page.query_selector_all(SELECTORS["tile"])
         current = len(cards)
-        print(f"Loaded {current}/{MAX_AUCTIONS} listings")
+        print(f"Loaded {current}/{max_auctions} listings")
 
         # If no new cards loaded, we might be at the end
         if current == loaded:
@@ -233,13 +233,13 @@ def collect_auction_urls(page):
         else:
             consecutive_failures = 0
 
-        for card in cards[loaded: min(current, MAX_AUCTIONS)]:
+        for card in cards[loaded: min(current, max_auctions)]:
             href = card.get_attribute("href")
             if href:
                 urls.append(href if href.startswith("http") else BASE_URL + href)
 
         loaded = current
-        if loaded >= MAX_AUCTIONS:
+        if loaded >= max_auctions:
             break
 
         # Look for load more button
@@ -406,10 +406,22 @@ def parse_auction(browser, url):
     page.close()
     return record
 
-def run_scraper():
+def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
     """Main scraper function"""
     print(f"\nStarting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    
+
+    # Build results URL with optional date filters (backfill mode)
+    effective_results_url = RESULTS_URL
+    if start_date or end_date:
+        params = []
+        if start_date:
+            params.append(f"s={start_date}")
+        if end_date:
+            params.append(f"e={end_date}")
+        effective_results_url = RESULTS_URL + "?" + "&".join(params)
+        print(f"[BACKFILL MODE] Date range: {start_date or 'unset'} → {end_date or 'unset'}")
+        print(f"[BACKFILL MODE] URL: {effective_results_url}")
+
     # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
     
@@ -431,7 +443,7 @@ def run_scraper():
 
         try:
             print("\n[5/8] Collecting auction URLs...")
-            urls = collect_auction_urls(collection_page)
+            urls = collect_auction_urls(collection_page, results_url=effective_results_url, max_auctions=max_auctions)
             
             # Close the collection page
             collection_page.close()
@@ -532,4 +544,13 @@ def run_scraper():
     print("=" * 60)
 
 if __name__ == "__main__":
-    run_scraper()
+    import argparse
+    parser = argparse.ArgumentParser(description="BaT Auction Scraper")
+    parser.add_argument("--start-date", metavar="YYYY-MM-DD", default=None,
+                        help="Filter auctions ending on or after this date (backfill mode)")
+    parser.add_argument("--end-date", metavar="YYYY-MM-DD", default=None,
+                        help="Filter auctions ending on or before this date (backfill mode)")
+    parser.add_argument("--max-auctions", type=int, default=MAX_AUCTIONS,
+                        help=f"Max auctions to collect (default: {MAX_AUCTIONS})")
+    args = parser.parse_args()
+    run_scraper(start_date=args.start_date, end_date=args.end_date, max_auctions=args.max_auctions)
