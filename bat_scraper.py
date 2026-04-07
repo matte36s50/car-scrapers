@@ -275,19 +275,15 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             break
 
         print("Clicking load more button...")
-        # Scroll + click entirely in JS — never touch an ElementHandle
-        page.evaluate(
-            """sel => {
-                const b = document.querySelector(sel);
-                b.scrollIntoView({block: 'center'});
-                b.click();
-            }""",
-            btn_sel
-        )
+        # Use locator().click() for proper mouse-event dispatch (JS .click()
+        # is synthetic and may not trigger all BaT event listeners)
+        page.locator(btn_sel).scroll_into_view_if_needed()
+        page.wait_for_timeout(500)
+        page.locator(btn_sel).click()
         page.wait_for_timeout(1000)
 
         # Poll for new tiles via JS count, not query_selector_all
-        deadline = 20_000  # ms
+        deadline = 30_000  # ms — increased from 20s for slow date-filtered pages
         poll_interval = 500
         elapsed = 0
         while elapsed < deadline:
@@ -476,6 +472,9 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
             print("Closed URL collection page")
             
             print(f"\n[6/8] Filtering URLs...")
+            # Log a sample of collected URLs so we can verify date range
+            if urls:
+                print(f"Sample URLs collected (first 3): {urls[:3]}")
             # Filter out URLs we've already scraped
             urls_to_scrape = [url for url in urls if url not in existing_urls]
             print(f"Total URLs collected: {len(urls)}")
