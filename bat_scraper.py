@@ -205,26 +205,32 @@ SELECTORS = {
 }
 
 def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTIONS):
-    """Collect auction URLs from results page"""
+    """Collect auction URLs from results page.
+
+    Uses only page.evaluate() / eval_on_selector_all() to avoid the
+    Playwright ElementHandle serialization bug ('dict' has no attr '_object')
+    that triggers after many dynamic DOM updates.
+    """
+    tile_sel = SELECTORS["tile"]
+    btn_sel  = SELECTORS["load_more"]
+
     print(f"\n[4/8] Navigating to results page: {results_url}")
     page.goto(results_url, timeout=60_000)
     print("Page loaded successfully")
 
-    print(f"Waiting for auction tiles selector: {SELECTORS['tile']}")
-    page.wait_for_selector(SELECTORS["tile"])
+    page.wait_for_selector(tile_sel)
     print("Auction tiles found")
 
-    urls, loaded = [], 0
+    urls = []
+    loaded = 0
     consecutive_failures = 0
     max_failures = 3
 
     while loaded < max_auctions:
-        current = page.eval_on_selector_all(
-            SELECTORS["tile"], "els => els.length"
-        )
+        # Count tiles entirely in JS — never create an ElementHandle
+        current = page.evaluate("s => document.querySelectorAll(s).length", tile_sel)
         print(f"Loaded {current}/{max_auctions} listings")
 
-        # If no new cards loaded, we might be at the end
         if current == loaded:
             consecutive_failures += 1
             print(f"No new listings loaded (attempt {consecutive_failures}/{max_failures})")
@@ -234,11 +240,14 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         else:
             consecutive_failures = 0
 
-        # Extract hrefs via JS to avoid stale ElementHandle serialization errors
+        # Batch-extract hrefs in JS; returns plain strings, no ElementHandle involved
         batch_limit = min(current, max_auctions)
-        new_hrefs = page.eval_on_selector_all(
-            SELECTORS["tile"],
-            f"els => els.slice({loaded}, {batch_limit}).map(el => el.getAttribute('href'))"
+        new_hrefs = page.evaluate(
+            """([sel, start, end]) =>
+                Array.from(document.querySelectorAll(sel))
+                     .slice(start, end)
+                     .map(el => el.getAttribute('href'))""",
+            [tile_sel, loaded, batch_limit]
         )
         for href in new_hrefs:
             if href:
@@ -248,39 +257,49 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         if loaded >= max_auctions:
             break
 
-        # Look for load more button
-        btn = page.query_selector(SELECTORS["load_more"])
-        if not btn:
+        # Check button existence + visibility entirely in JS
+        btn_state = page.evaluate(
+            """sel => {
+                const b = document.querySelector(sel);
+                if (!b) return 'missing';
+                const r = b.getBoundingClientRect();
+                return (r.width > 0 && r.height > 0) ? 'visible' : 'hidden';
+            }""",
+            btn_sel
+        )
+        if btn_state == 'missing':
             print("Load more button not found - reached end of listings")
             break
-        
-        if not btn.is_visible():
+        if btn_state == 'hidden':
             print("Load more button not visible - reached end of listings")
             break
-            
-        print(f"Clicking load more button...")
-        btn.scroll_into_view_if_needed()
-        page.wait_for_timeout(1000)
-        btn.click()
 
-        # Poll for new cards rather than using wait_for_function (avoids
-        # Playwright list-arg serialization bug: 'dict' has no attr '_object')
+        print("Clicking load more button...")
+        # Scroll + click entirely in JS — never touch an ElementHandle
+        page.evaluate(
+            """sel => {
+                const b = document.querySelector(sel);
+                b.scrollIntoView({block: 'center'});
+                b.click();
+            }""",
+            btn_sel
+        )
+        page.wait_for_timeout(1000)
+
+        # Poll for new tiles via JS count, not query_selector_all
         deadline = 20_000  # ms
-        poll_interval = 500  # ms
+        poll_interval = 500
         elapsed = 0
-        new_count = loaded
         while elapsed < deadline:
             page.wait_for_timeout(poll_interval)
             elapsed += poll_interval
-            new_count = len(page.query_selector_all(SELECTORS["tile"]))
+            new_count = page.evaluate("s => document.querySelectorAll(s).length", tile_sel)
             if new_count > loaded:
-                print(f"Successfully loaded more listings")
+                print("Successfully loaded more listings")
                 break
         else:
-            print(f"Timeout waiting for more listings after {deadline}ms")
-            if new_count <= loaded:
-                print("No additional listings found - stopping collection")
-                break
+            print(f"Timeout waiting for more listings after {deadline}ms — stopping")
+            break
 
     print(f"Collection complete: found {len(urls)} auction URLs")
     return urls
