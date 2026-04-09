@@ -207,12 +207,25 @@ SELECTORS = {
 def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTIONS):
     """Collect auction URLs from results page.
 
-    Uses only page.evaluate() / eval_on_selector_all() to avoid the
-    Playwright ElementHandle serialization bug ('dict' has no attr '_object')
-    that triggers after many dynamic DOM updates.
+    Uses only page.evaluate() to avoid the Playwright ElementHandle
+    serialization bug. Also intercepts XHR/fetch calls to log BaT's
+    internal pagination API so we can use it directly for date filtering.
     """
     tile_sel = SELECTORS["tile"]
     btn_sel  = SELECTORS["load_more"]
+
+    # Intercept API requests made by the page so we can discover BaT's
+    # internal auction-listing endpoint (used to build date-filtered requests)
+    api_calls = []
+    def on_request(req):
+        if req.resource_type in ("xhr", "fetch") and "bringatrailer.com" in req.url:
+            body = ""
+            try:
+                body = req.post_data or ""
+            except Exception:
+                pass
+            api_calls.append(f"[{req.method}] {req.url}" + (f" | body: {body[:200]}" if body else ""))
+    page.on("request", on_request)
 
     print(f"\n[4/8] Navigating to results page: {results_url}")
     page.goto(results_url, timeout=60_000)
@@ -275,12 +288,16 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             break
 
         print("Clicking load more button...")
-        # Use locator().click() for proper mouse-event dispatch (JS .click()
-        # is synthetic and may not trigger all BaT event listeners)
+        api_calls.clear()  # reset so we only see calls from this click
         page.locator(btn_sel).scroll_into_view_if_needed()
         page.wait_for_timeout(500)
         page.locator(btn_sel).click()
         page.wait_for_timeout(1000)
+        # Log API calls made by this click (first click only — enough to ID the endpoint)
+        if loaded <= 60 and api_calls:
+            print(f"[API INTERCEPT] Calls from load-more click:")
+            for c in api_calls:
+                print(f"  {c}")
 
         # Poll for new tiles via JS count. Use a generous timeout — at 10k+
         # DOM nodes the browser renders slowly after each load-more.
@@ -302,6 +319,14 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             break
 
     print(f"Collection complete: found {len(urls)} auction URLs")
+    # Deduplicate and print all distinct API endpoints seen — this reveals
+    # BaT's internal listing API so we can call it directly with date params
+    seen_endpoints = set()
+    for call in api_calls:
+        endpoint = call.split(" | ")[0]  # strip body
+        if endpoint not in seen_endpoints:
+            seen_endpoints.add(endpoint)
+            print(f"[API ENDPOINT] {endpoint}")
     return urls
 
 def parse_auction(browser, url):
