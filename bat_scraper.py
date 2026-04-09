@@ -275,19 +275,15 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             break
 
         print("Clicking load more button...")
-        # Scroll + click entirely in JS — never touch an ElementHandle
-        page.evaluate(
-            """sel => {
-                const b = document.querySelector(sel);
-                b.scrollIntoView({block: 'center'});
-                b.click();
-            }""",
-            btn_sel
-        )
+        # Use locator().click() for proper mouse-event dispatch (JS .click()
+        # is synthetic and may not trigger all BaT event listeners)
+        page.locator(btn_sel).scroll_into_view_if_needed()
+        page.wait_for_timeout(500)
+        page.locator(btn_sel).click()
         page.wait_for_timeout(1000)
 
         # Poll for new tiles via JS count, not query_selector_all
-        deadline = 20_000  # ms
+        deadline = 30_000  # ms — increased from 20s for slow date-filtered pages
         poll_interval = 500
         elapsed = 0
         while elapsed < deadline:
@@ -436,17 +432,13 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
     """Main scraper function"""
     print(f"\nStarting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    # Build results URL with optional date filters (backfill mode)
-    effective_results_url = RESULTS_URL
-    if start_date or end_date:
-        params = []
-        if start_date:
-            params.append(f"s={start_date}")
-        if end_date:
-            params.append(f"e={end_date}")
-        effective_results_url = RESULTS_URL + "?" + "&".join(params)
+    is_backfill = bool(start_date or end_date)
+    start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    end_dt   = datetime.datetime.strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
+    if is_backfill:
         print(f"[BACKFILL MODE] Date range: {start_date or 'unset'} → {end_date or 'unset'}")
-        print(f"[BACKFILL MODE] URL: {effective_results_url}")
+        print(f"[BACKFILL MODE] Note: BaT URL date params are not reliable; "
+              f"filtering by sale_date extracted from each auction page")
 
     # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
@@ -469,13 +461,16 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
 
         try:
             print("\n[5/8] Collecting auction URLs...")
-            urls = collect_auction_urls(collection_page, results_url=effective_results_url, max_auctions=max_auctions)
+            urls = collect_auction_urls(collection_page, max_auctions=max_auctions)
             
             # Close the collection page
             collection_page.close()
             print("Closed URL collection page")
             
             print(f"\n[6/8] Filtering URLs...")
+            # Log a sample of collected URLs so we can verify date range
+            if urls:
+                print(f"Sample URLs collected (first 3): {urls[:3]}")
             # Filter out URLs we've already scraped
             urls_to_scrape = [url for url in urls if url not in existing_urls]
             print(f"Total URLs collected: {len(urls)}")
@@ -483,27 +478,57 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
             print(f"New URLs to scrape: {len(urls_to_scrape)}")
 
             print(f"\n[7/8] Scraping individual auction pages...")
+            consecutive_too_old = 0
             for i, url in enumerate(urls_to_scrape, 1):
                 try:
                     print(f"\n[{i}/{len(urls_to_scrape)}] Processing: {url}")
                     # Pass browser instead of page - function creates its own page
                     data = parse_auction(browser, url)
+
+                    # Backfill date-range enforcement
+                    if is_backfill and data.get('sale_date'):
+                        try:
+                            auction_dt = None
+                            for fmt in ("%m/%d/%Y", "%m/%d/%y", "%B %d, %Y", "%b %d, %Y"):
+                                try:
+                                    auction_dt = datetime.datetime.strptime(
+                                        data['sale_date'].strip(), fmt
+                                    ).date()
+                                    break
+                                except ValueError:
+                                    continue
+                            if auction_dt:
+                                if end_dt and auction_dt > end_dt:
+                                    print(f"  [BACKFILL] Skip {auction_dt} — after end_date {end_dt}")
+                                    continue
+                                if start_dt and auction_dt < start_dt:
+                                    consecutive_too_old += 1
+                                    print(f"  [BACKFILL] Skip {auction_dt} — before start_date {start_dt} ({consecutive_too_old}/10)")
+                                    if consecutive_too_old >= 10:
+                                        print("  [BACKFILL] 10 consecutive out-of-range — stopping early")
+                                        break
+                                    continue
+                                else:
+                                    consecutive_too_old = 0
+                        except Exception as date_err:
+                            print(f"  [BACKFILL] Could not parse sale_date '{data.get('sale_date')}': {date_err}")
+
                     new_data.append(data)
-                    
+
                     # Track year extraction success
                     if data.get('year'):
                         years_extracted.append(data['year'])
-                    
+
                     # Track URL model extraction
                     if 'Model from URL' in str(data):
                         models_from_url += 1
-                    
+
                     year_display = f"({data.get('year', 'No Year')})"
                     sale_type = data.get('sale_type', 'N/A')
                     sale_amount = data.get('sale_amount', 'N/A')
                     model_display = data.get('model', 'N/A')[:40]
                     print(f"  Result: {year_display} {model_display} - {sale_type} - {sale_amount}")
-                    
+
                 except Exception as e:
                     print(f"  Unexpected error: {str(e)[:80]}")
                     new_data.append({"auction_url": url, "error": str(e)[:100]})
