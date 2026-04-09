@@ -209,35 +209,27 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
     tile_sel = SELECTORS["tile"]
     btn_sel  = SELECTORS["load_more"]
 
-    # Capture ALL network activity around the load-more click so we can
-    # find BaT's internal listing API (needed for date-filtered backfills)
-    SKIP_TYPES = {"image", "stylesheet", "font", "media", "ping", "preflight"}
-    net_log = []
-
-    def on_request(req):
-        if req.resource_type in SKIP_TYPES:
-            return
-        body = ""
-        try:
-            body = (req.post_data or "")[:300]
-        except Exception:
-            pass
-        net_log.append(("REQ", req.resource_type, req.method, req.url, body))
-
-    def on_response(res):
-        ct = res.headers.get("content-type", "")
-        if "json" not in ct and "javascript" not in ct:
-            return
-        if res.resource_type in SKIP_TYPES:
-            return
-        net_log.append(("RES", res.status, res.url, ct[:80]))
-
-    page.on("request",  on_request)
-    page.on("response", on_response)
-
     print(f"\n[4/8] Navigating to results page: {results_url}")
     page.goto(results_url, timeout=60_000)
     print("Page loaded successfully")
+
+    # Patch fetch + XHR inside the page JS so we capture network calls
+    # even during Playwright blocking waits (page.on events miss these)
+    page.evaluate("""() => {
+        window.__netLog = [];
+        const _fetch = window.fetch;
+        window.fetch = function(...args) {
+            const url = typeof args[0] === 'string' ? args[0] : args[0]?.url;
+            const method = args[1]?.method || 'GET';
+            window.__netLog.push('fetch ' + method + ' ' + url);
+            return _fetch.apply(this, args);
+        };
+        const _open = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            window.__netLog.push('xhr ' + method + ' ' + url);
+            return _open.apply(this, arguments);
+        };
+    }""")
 
     page.wait_for_selector(tile_sel)
     print("Auction tiles found")
@@ -296,16 +288,17 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             break
 
         print("Clicking load more button...")
-        net_log.clear()   # reset — we want only traffic from this one click
+        page.evaluate("() => { window.__netLog = []; }")  # clear before click
         page.locator(btn_sel).scroll_into_view_if_needed()
         page.wait_for_timeout(500)
         page.locator(btn_sel).click()
-        page.wait_for_timeout(2000)   # wait a bit so async responses arrive
-        # On first two clicks only, dump everything we saw on the wire
+        page.wait_for_timeout(2000)   # let async requests fire
+        # On first two clicks, dump what JS saw on the wire
         if loaded <= 80:
-            print(f"[NET] {len(net_log)} events after load-more click:")
-            for entry in net_log:
-                print(f"  {entry}")
+            net_events = page.evaluate("() => window.__netLog.slice()")
+            print(f"[NET] {len(net_events)} JS network calls after load-more:")
+            for e in net_events:
+                print(f"  {e}")
 
         # Poll for new tiles via JS count. Use a generous timeout — at 10k+
         # DOM nodes the browser renders slowly after each load-more.
