@@ -282,19 +282,32 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         page.locator(btn_sel).click()
         page.wait_for_timeout(1000)
 
-        # Poll for new tiles via JS count, not query_selector_all
-        deadline = 30_000  # ms — increased from 20s for slow date-filtered pages
-        poll_interval = 500
-        elapsed = 0
-        while elapsed < deadline:
-            page.wait_for_timeout(poll_interval)
-            elapsed += poll_interval
-            new_count = page.evaluate("s => document.querySelectorAll(s).length", tile_sel)
-            if new_count > loaded:
-                print("Successfully loaded more listings")
+        # Poll for new tiles. Timeout scales up with page size — a DOM with
+        # thousands of nodes takes longer to render after each "load more".
+        # Retry the click once if the first poll window expires (the network
+        # request may have completed but rendering was still in progress).
+        loaded_new = False
+        for attempt in range(2):
+            poll_deadline = 60_000 if loaded > 5_000 else 30_000
+            poll_interval = 500
+            elapsed = 0
+            while elapsed < poll_deadline:
+                page.wait_for_timeout(poll_interval)
+                elapsed += poll_interval
+                new_count = page.evaluate("s => document.querySelectorAll(s).length", tile_sel)
+                if new_count > loaded:
+                    print("Successfully loaded more listings")
+                    loaded_new = True
+                    break
+            if loaded_new:
                 break
-        else:
-            print(f"Timeout waiting for more listings after {deadline}ms — stopping")
+            if attempt == 0:
+                print(f"Timeout after {poll_deadline}ms — retrying click...")
+                page.locator(btn_sel).click()
+                page.wait_for_timeout(2000)
+
+        if not loaded_new:
+            print(f"Load more did not respond after 2 attempts — stopping collection")
             break
 
     print(f"Collection complete: found {len(urls)} auction URLs")
