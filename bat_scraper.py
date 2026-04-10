@@ -204,6 +204,119 @@ SELECTORS = {
     "group_items": "div.group-item-wrap > div.group-item",
 }
 
+def collect_auction_urls_paged(page, start_date=None, end_date=None, max_auctions=10_000):
+    """
+    Backfill mode: navigate directly to the estimated page number instead of
+    infinite-scrolling from the top.  Avoids the ~10k item infinite-scroll cap.
+
+    BaT results are newest-first.  We estimate the starting page from end_date,
+    scan forward (higher page numbers = older auctions) through start_date, and
+    return all collected hrefs.  The caller's date-range filter then keeps only
+    what falls inside the window.
+    """
+    tile_sel = SELECTORS["tile"]
+    today    = datetime.date.today()
+
+    start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
+    end_dt   = datetime.datetime.strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
+
+    # Estimate page range.  BaT ≈ 100 auctions/day, ~36 tiles/page → ~2.78 pages/day.
+    AUCTIONS_PER_DAY = 100
+    TILES_PER_PAGE   = 36
+    ppd = AUCTIONS_PER_DAY / TILES_PER_PAGE   # pages per day
+
+    if end_dt:
+        days_to_end = max(0, (today - end_dt).days)
+        first_page  = max(1, int(days_to_end * ppd) - 15)   # 15-page early buffer
+    else:
+        first_page = 1
+
+    if start_dt:
+        days_to_start = max(0, (today - start_dt).days)
+        last_page     = int(days_to_start * ppd) + 15       # 15-page late buffer
+    else:
+        last_page = first_page + 120   # fallback: scan 120 pages
+
+    print(f"\n[4/8] BACKFILL mode — direct page navigation")
+    print(f"[BACKFILL] Target: {start_date or 'unset'} → {end_date or 'unset'}")
+    print(f"[BACKFILL] Estimated pages to scan: {first_page}–{last_page} "
+          f"({last_page - first_page + 1} pages)")
+
+    # Test that /page/N/ pagination works (standard WordPress archive format)
+    test_url = f"{RESULTS_URL}page/{first_page}/"
+    print(f"[BACKFILL] Loading first estimated page: {test_url}")
+    resp = page.goto(test_url, timeout=60_000)
+
+    # Fallback: try query-string paging if path-style returns 404
+    if resp and resp.status == 404:
+        test_url = f"{RESULTS_URL}?paged={first_page}"
+        print(f"[BACKFILL] /page/N/ → 404; trying ?paged=N: {test_url}")
+        resp = page.goto(test_url, timeout=60_000)
+
+    try:
+        page.wait_for_selector(tile_sel, timeout=15_000)
+        print(f"[BACKFILL] Pagination works — tiles found on page {first_page}")
+    except Exception:
+        # If direct jump fails, fall back to page 1 and warn
+        print(f"[BACKFILL] WARNING: no tiles at estimated page {first_page}. "
+              f"BaT may not support /page/N/ — falling back to page 1 (infinite scroll will cap at ~10k).")
+        first_page = 1
+        last_page  = max(last_page, 100)
+        page.goto(RESULTS_URL, timeout=60_000)
+        page.wait_for_selector(tile_sel)
+
+    # Log the first tile's HTML once — helps diagnose tile structure
+    first_tile_html = page.evaluate(
+        "sel => document.querySelector(sel)?.outerHTML?.slice(0, 500) || 'not found'",
+        tile_sel
+    )
+    print(f"[BACKFILL] First tile HTML sample:\n{first_tile_html}\n")
+
+    urls        = []
+    page_num    = first_page
+    empty_pages = 0
+
+    while page_num <= last_page and len(urls) < max_auctions:
+        if page_num != first_page:
+            page_url = f"{RESULTS_URL}page/{page_num}/"
+            print(f"[BACKFILL] Page {page_num}/{last_page}...")
+            try:
+                resp = page.goto(page_url, timeout=60_000)
+                if resp and resp.status == 404:
+                    print(f"[BACKFILL] Page {page_num} → 404, end of results")
+                    break
+            except Exception as e:
+                print(f"[BACKFILL] Failed to load page {page_num}: {e}")
+                break
+            try:
+                page.wait_for_selector(tile_sel, timeout=10_000)
+            except Exception:
+                print(f"[BACKFILL] No tiles on page {page_num} — stopping")
+                break
+
+        hrefs = page.evaluate(
+            "sel => Array.from(document.querySelectorAll(sel)).map(e => e.getAttribute('href'))",
+            tile_sel
+        )
+        page_urls = [h if h.startswith("http") else BASE_URL + h for h in hrefs if h]
+
+        if not page_urls:
+            empty_pages += 1
+            if empty_pages >= 3:
+                print("[BACKFILL] 3 consecutive empty pages — stopping")
+                break
+        else:
+            empty_pages = 0
+
+        urls.extend(page_urls)
+        print(f"[BACKFILL]   page {page_num}: {len(page_urls)} URLs  (running total: {len(urls)})")
+        page_num += 1
+
+    print(f"[BACKFILL] URL collection complete: {len(urls)} URLs "
+          f"from pages {first_page}–{page_num - 1}")
+    return urls
+
+
 def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTIONS):
     """Collect auction URLs from results page."""
     tile_sel = SELECTORS["tile"]
@@ -541,7 +654,15 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
 
         try:
             print("\n[5/8] Collecting auction URLs...")
-            urls = collect_auction_urls(collection_page, max_auctions=max_auctions)
+            if is_backfill:
+                urls = collect_auction_urls_paged(
+                    collection_page,
+                    start_date=start_date,
+                    end_date=end_date,
+                    max_auctions=max_auctions,
+                )
+            else:
+                urls = collect_auction_urls(collection_page, max_auctions=max_auctions)
             
             # Close the collection page
             collection_page.close()
@@ -681,7 +802,12 @@ if __name__ == "__main__":
                         help="Filter auctions ending on or after this date (backfill mode)")
     parser.add_argument("--end-date", metavar="YYYY-MM-DD", default=None,
                         help="Filter auctions ending on or before this date (backfill mode)")
-    parser.add_argument("--max-auctions", type=int, default=MAX_AUCTIONS,
-                        help=f"Max auctions to collect (default: {MAX_AUCTIONS})")
+    parser.add_argument("--max-auctions", type=int, default=None,
+                        help="Max auctions to collect. Defaults to 500 for normal runs, "
+                             "10000 for backfill runs.")
     args = parser.parse_args()
+    # Choose a sensible default: backfill needs a large cap; normal runs keep the original 500
+    is_backfill_run = bool(args.start_date or args.end_date)
+    if args.max_auctions is None:
+        args.max_auctions = 10_000 if is_backfill_run else MAX_AUCTIONS
     run_scraper(start_date=args.start_date, end_date=args.end_date, max_auctions=args.max_auctions)
