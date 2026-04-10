@@ -234,6 +234,53 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
     page.wait_for_selector(tile_sel)
     print("Auction tiles found")
 
+    # --- One-time diagnostics to understand BaT's data loading mechanism ---
+    # Check if all auction data is pre-loaded in window JS state
+    bat_state = page.evaluate("""() => {
+        const results = {};
+        for (const key of Object.keys(window)) {
+            try {
+                const v = window[key];
+                if (v && typeof v === 'object') {
+                    const s = JSON.stringify(v);
+                    if (s && s.includes('bringatrailer.com/listing') && s.length > 500) {
+                        results[key] = s.length;
+                    }
+                }
+            } catch(e) {}
+        }
+        return results;
+    }""")
+    print(f"[STATE] Window keys with embedded listing data: {bat_state}")
+
+    # Check for large inline <script> blocks that might contain auction JSON
+    script_info = page.evaluate("""() =>
+        Array.from(document.querySelectorAll('script'))
+            .filter(s => !s.src && s.textContent.includes('bringatrailer'))
+            .map(s => ({ len: s.textContent.length, snippet: s.textContent.slice(0, 120) }))
+    """)
+    print(f"[STATE] Inline scripts with 'bringatrailer' text: {len(script_info)}")
+    for si in script_info[:5]:
+        print(f"  len={si['len']}  snippet={si['snippet']!r}")
+
+    # Check for active WebSocket connections
+    ws_check = page.evaluate("""() => {
+        const orig = window.WebSocket;
+        const active = window.__wsUrls || [];
+        if (!window.__wsPatched) {
+            window.__wsPatched = true;
+            window.__wsUrls = active;
+            window.WebSocket = function(url, protos) {
+                active.push(url);
+                return new orig(url, protos);
+            };
+            Object.assign(window.WebSocket, orig);
+        }
+        return active;
+    }""")
+    print(f"[STATE] WebSocket URLs (pre-patch): {ws_check}")
+    # --- end diagnostics ---
+
     urls = []
     loaded = 0
     consecutive_failures = 0
@@ -288,17 +335,28 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             break
 
         print("Clicking load more button...")
-        page.evaluate("() => { window.__netLog = []; }")  # clear before click
+        page.evaluate("() => { window.__netLog = []; performance.clearResourceTimings(); }")
         page.locator(btn_sel).scroll_into_view_if_needed()
         page.wait_for_timeout(500)
         page.locator(btn_sel).click()
         page.wait_for_timeout(2000)   # let async requests fire
-        # On first two clicks, dump what JS saw on the wire
+        # On first two clicks, dump everything JS and the browser saw on the wire
         if loaded <= 80:
             net_events = page.evaluate("() => window.__netLog.slice()")
-            print(f"[NET] {len(net_events)} JS network calls after load-more:")
+            print(f"[NET] {len(net_events)} fetch/XHR calls after load-more:")
             for e in net_events:
                 print(f"  {e}")
+
+            perf_entries = page.evaluate("""() =>
+                performance.getEntriesByType('resource')
+                    .map(e => e.initiatorType + ' ' + Math.round(e.transferSize||0) + 'b ' + e.name)
+            """)
+            print(f"[PERF] {len(perf_entries)} browser resource entries after load-more:")
+            for e in perf_entries[:30]:
+                print(f"  {e}")
+
+            ws_urls = page.evaluate("() => window.__wsUrls || []")
+            print(f"[WS] WebSocket URLs opened so far: {ws_urls}")
 
         # Poll for new tiles via JS count. Use a generous timeout — at 10k+
         # DOM nodes the browser renders slowly after each load-more.
