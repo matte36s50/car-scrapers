@@ -21,7 +21,7 @@ on:
           - cnb
         default: both
       max_auctions:
-        description: 'Max auctions per scraper (leave blank for scraper defaults)'
+        description: 'Max auctions per scraper (leave blank for scraper defaults; use ~3000 for a full month of BAT)'
         required: false
         type: string
         default: ''
