@@ -204,15 +204,55 @@ SELECTORS = {
     "group_items": "div.group-item-wrap > div.group-item",
 }
 
-def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTIONS):
-    """Collect auction URLs from results page.
+def parse_tile_date(text):
+    """Try to extract a sale date from BaT results tile text content.
+
+    BaT tiles typically show the end date as 'January 15, 2026' or '1/15/26'.
+    Returns a datetime.date or None if no date could be parsed.
+    """
+    if not text:
+        return None
+    try:
+        m = re.search(
+            r'\b(January|February|March|April|May|June|July|August'
+            r'|September|October|November|December)\s+(\d{1,2}),?\s+(\d{4})\b', text)
+        if m:
+            return datetime.datetime.strptime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)}", "%B %d %Y"
+            ).date()
+        m = re.search(
+            r'\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2}),?\s+(\d{4})\b', text)
+        if m:
+            return datetime.datetime.strptime(
+                f"{m.group(1)} {m.group(2)} {m.group(3)}", "%b %d %Y"
+            ).date()
+        m = re.search(r'\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b', text)
+        if m:
+            month, day, year = int(m.group(1)), int(m.group(2)), int(m.group(3))
+            if year < 100:
+                year += 2000
+            if 1 <= month <= 12 and 1 <= day <= 31 and 2000 <= year <= 2100:
+                return datetime.date(year, month, day)
+    except Exception:
+        pass
+    return None
+
+
+def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTIONS,
+                         start_date=None, end_date=None):
+    """Collect auction URLs from results page, with optional date-based early stopping.
 
     Uses only page.evaluate() / eval_on_selector_all() to avoid the
     Playwright ElementHandle serialization bug ('dict' has no attr '_object')
     that triggers after many dynamic DOM updates.
+
+    Returns a list of (url, tile_date) tuples where tile_date is a datetime.date
+    extracted from the tile text, or None if it could not be parsed.
     """
     tile_sel = SELECTORS["tile"]
     btn_sel  = SELECTORS["load_more"]
+
+    collect_start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
 
     print(f"\n[4/8] Navigating to results page: {results_url}")
     page.goto(results_url, timeout=60_000)
@@ -221,10 +261,11 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
     page.wait_for_selector(tile_sel)
     print("Auction tiles found")
 
-    urls = []
+    pairs = []   # (url, tile_date | None)
     loaded = 0
     consecutive_failures = 0
     max_failures = 3
+    consecutive_too_old_collect = 0
 
     while loaded < max_auctions:
         # Count tiles entirely in JS — never create an ElementHandle
@@ -240,18 +281,40 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
         else:
             consecutive_failures = 0
 
-        # Batch-extract hrefs in JS; returns plain strings, no ElementHandle involved
+        # Batch-extract hrefs + tile text in JS for date-based early stopping.
+        # text is capped at 300 chars — enough to contain the sale date.
         batch_limit = min(current, max_auctions)
-        new_hrefs = page.evaluate(
+        new_items = page.evaluate(
             """([sel, start, end]) =>
                 Array.from(document.querySelectorAll(sel))
                      .slice(start, end)
-                     .map(el => el.getAttribute('href'))""",
+                     .map(el => [
+                         el.getAttribute('href') || '',
+                         el.textContent.replace(/\\s+/g, ' ').trim().slice(0, 300)
+                     ])""",
             [tile_sel, loaded, batch_limit]
         )
-        for href in new_hrefs:
-            if href:
-                urls.append(href if href.startswith("http") else BASE_URL + href)
+        stop_early = False
+        for item in new_items:
+            href, text = item[0], item[1]
+            if not href:
+                continue
+            url = href if href.startswith("http") else BASE_URL + href
+            tile_dt = parse_tile_date(text)
+            pairs.append((url, tile_dt))
+            # Stop loading more tiles once we've scrolled far enough past start_date
+            if collect_start_dt and tile_dt:
+                if tile_dt < collect_start_dt:
+                    consecutive_too_old_collect += 1
+                    if consecutive_too_old_collect >= 10:
+                        print(f"  [COLLECT] Early stop: 10 consecutive tiles before "
+                              f"start_date {collect_start_dt}")
+                        stop_early = True
+                        break
+                else:
+                    consecutive_too_old_collect = 0
+        if stop_early:
+            break
 
         loaded = current
         if loaded >= max_auctions:
@@ -310,8 +373,8 @@ def collect_auction_urls(page, results_url=RESULTS_URL, max_auctions=MAX_AUCTION
             print(f"Load more did not respond after 2 attempts — stopping collection")
             break
 
-    print(f"Collection complete: found {len(urls)} auction URLs")
-    return urls
+    print(f"Collection complete: found {len(pairs)} auction URLs")
+    return pairs
 
 def parse_auction(browser, url):
     """Parse individual auction page - creates fresh page each time"""
@@ -449,21 +512,10 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
     start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
     end_dt   = datetime.datetime.strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
 
-    # Build date-filtered results URL for backfill to avoid scrolling past thousands of auctions.
-    # BaT's sold_after/sold_before params pre-filter the results page to the target date range,
-    # reducing scroll depth from ~10k auctions to just the target month's auctions.
-    # Page-level sale_date filtering below still handles any auctions that slip through.
-    results_url = RESULTS_URL
     if is_backfill:
         print(f"[BACKFILL MODE] Date range: {start_date or 'unset'} → {end_date or 'unset'}")
-        params = []
-        if start_dt:
-            params.append(f"sold_after={start_dt.strftime('%m%%2F%d%%2F%Y')}")
-        if end_dt:
-            params.append(f"sold_before={end_dt.strftime('%m%%2F%d%%2F%Y')}")
-        if params:
-            results_url = f"{RESULTS_URL}?{'&'.join(params)}"
-            print(f"[BACKFILL MODE] Using date-filtered URL: {results_url}")
+        print(f"[BACKFILL MODE] Tile dates extracted during collection will be used to "
+              f"skip page visits outside the target range")
 
     # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
@@ -486,27 +538,51 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
 
         try:
             print("\n[5/8] Collecting auction URLs...")
-            urls = collect_auction_urls(collection_page, results_url=results_url, max_auctions=max_auctions)
-            
+            pairs = collect_auction_urls(
+                collection_page, results_url=RESULTS_URL, max_auctions=max_auctions,
+                start_date=start_date, end_date=end_date
+            )
+
             # Close the collection page
             collection_page.close()
             print("Closed URL collection page")
-            
+
             print(f"\n[6/8] Filtering URLs...")
-            # Log a sample of collected URLs so we can verify date range
-            if urls:
-                print(f"Sample URLs collected (first 3): {urls[:3]}")
+            # Log a sample so we can verify tile-date extraction is working
+            if pairs:
+                sample = [(u, str(d)) for u, d in pairs[:3]]
+                print(f"Sample (url, tile_date) (first 3): {sample}")
             # Filter out URLs we've already scraped
-            urls_to_scrape = [url for url in urls if url not in existing_urls]
-            print(f"Total URLs collected: {len(urls)}")
-            print(f"Already scraped: {len(urls) - len(urls_to_scrape)}")
+            urls_to_scrape = [(url, td) for url, td in pairs if url not in existing_urls]
+            print(f"Total URLs collected: {len(pairs)}")
+            print(f"Already scraped: {len(pairs) - len(urls_to_scrape)}")
             print(f"New URLs to scrape: {len(urls_to_scrape)}")
 
             print(f"\n[7/8] Scraping individual auction pages...")
             consecutive_too_old = 0
-            for i, url in enumerate(urls_to_scrape, 1):
+            for i, (url, tile_dt) in enumerate(urls_to_scrape, 1):
                 try:
-                    print(f"\n[{i}/{len(urls_to_scrape)}] Processing: {url}")
+                    print(f"\n[{i}/{len(urls_to_scrape)}] Processing: {url}"
+                          + (f" [tile_date={tile_dt}]" if tile_dt else ""))
+
+                    # Pre-filter using tile date to avoid visiting out-of-range pages.
+                    # Tile dates aren't verified (they're scraped from tile text), so
+                    # we still do page-level sale_date verification below as ground truth.
+                    if is_backfill and tile_dt:
+                        if end_dt and tile_dt > end_dt:
+                            print(f"  [PRE-FILTER] Skip — tile_date {tile_dt} after end_date {end_dt}")
+                            continue
+                        if start_dt and tile_dt < start_dt:
+                            consecutive_too_old += 1
+                            print(f"  [PRE-FILTER] Skip — tile_date {tile_dt} before start_date {start_dt}"
+                                  f" ({consecutive_too_old}/10)")
+                            if consecutive_too_old >= 10:
+                                print("  [PRE-FILTER] 10 consecutive out-of-range — stopping early")
+                                break
+                            continue
+                        else:
+                            consecutive_too_old = 0
+
                     # Pass browser instead of page - function creates its own page
                     data = parse_auction(browser, url)
 
