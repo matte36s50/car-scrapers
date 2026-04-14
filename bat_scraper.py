@@ -448,10 +448,22 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
     is_backfill = bool(start_date or end_date)
     start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
     end_dt   = datetime.datetime.strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
+
+    # Build date-filtered results URL for backfill to avoid scrolling past thousands of auctions.
+    # BaT's sold_after/sold_before params pre-filter the results page to the target date range,
+    # reducing scroll depth from ~10k auctions to just the target month's auctions.
+    # Page-level sale_date filtering below still handles any auctions that slip through.
+    results_url = RESULTS_URL
     if is_backfill:
         print(f"[BACKFILL MODE] Date range: {start_date or 'unset'} → {end_date or 'unset'}")
-        print(f"[BACKFILL MODE] Note: BaT URL date params are not reliable; "
-              f"filtering by sale_date extracted from each auction page")
+        params = []
+        if start_dt:
+            params.append(f"sold_after={start_dt.strftime('%m%%2F%d%%2F%Y')}")
+        if end_dt:
+            params.append(f"sold_before={end_dt.strftime('%m%%2F%d%%2F%Y')}")
+        if params:
+            results_url = f"{RESULTS_URL}?{'&'.join(params)}"
+            print(f"[BACKFILL MODE] Using date-filtered URL: {results_url}")
 
     # Download existing data from S3
     existing_df, existing_urls = download_existing_bat_csv()
@@ -474,7 +486,7 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
 
         try:
             print("\n[5/8] Collecting auction URLs...")
-            urls = collect_auction_urls(collection_page, max_auctions=max_auctions)
+            urls = collect_auction_urls(collection_page, results_url=results_url, max_auctions=max_auctions)
             
             # Close the collection page
             collection_page.close()
