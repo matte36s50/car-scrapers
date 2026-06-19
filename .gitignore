@@ -15,5 +15,10 @@ cnb.csv
 bat*.csv
 cnb*.csv
 
+# Social metrics / social score runtime caches
+social_metrics_cache.json
+social_score_cache.json
+social_metrics_*.csv
+
 # Keep Python scripts
 !*.py
