@@ -73,7 +73,15 @@ jobs:
         else
           echo "⚠️ No existing bat.csv in S3 (scrapers will create new file)"
         fi
-        
+
+        # Download persisted social score cache (accumulates coverage over runs)
+        if aws s3 ls s3://my-mii-reports/cache/social_score_cache.json; then
+          aws s3 cp s3://my-mii-reports/cache/social_score_cache.json social_score_cache.json
+          echo "✓ Downloaded social_score_cache.json"
+        else
+          echo "⚠️ No existing social_score_cache.json in S3 (will be created)"
+        fi
+
         echo ""
         echo "Files ready for scrapers:"
         ls -lh *.csv 2>/dev/null || echo "Starting fresh (no existing files)"
@@ -132,11 +140,30 @@ jobs:
         ls -lh cnb.csv bat.csv 2>/dev/null || echo "Warning: Some files may be missing"
         
         python enhanced_mii_all_models.py || echo "MII calculator encountered errors"
-        
+
         # Create mii_results_latest.csv for backward compatibility with website
         if [ -f mii_individual_auctions.csv ]; then
           cp mii_individual_auctions.csv mii_results_latest.csv
           echo "✓ Created mii_results_latest.csv (copy of individual auctions)"
+        fi
+      env:
+        # Social score sub-signal credentials. All optional: when a secret is
+        # unset, that collector returns no data and its weight renormalizes out.
+        YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+        REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+        REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+        SOCIAL_IGTT_PROVIDER: ${{ secrets.SOCIAL_IGTT_PROVIDER }}
+      continue-on-error: true
+
+    - name: Persist social score cache to S3
+      if: always()
+      run: |
+        if [ -f social_score_cache.json ]; then
+          aws s3 cp social_score_cache.json s3://my-mii-reports/cache/social_score_cache.json
+          echo "✓ Persisted social_score_cache.json to S3"
+        else
+          echo "⚠️ No social_score_cache.json to persist"
         fi
       continue-on-error: true
       
