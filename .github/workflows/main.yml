@@ -154,6 +154,10 @@ jobs:
         REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
         REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
         SOCIAL_IGTT_PROVIDER: ${{ secrets.SOCIAL_IGTT_PROVIDER }}
+        # Per-run YouTube quota cap (units; search.list = 100, free tier 10k/day).
+        # Defaults to 9000 in code; the scheduled runs (06:00 & 18:00 UTC) share
+        # the daily quota, so cap each well under 10k.
+        YOUTUBE_QUOTA_BUDGET: '4500'
       continue-on-error: true
 
     - name: Persist social score cache to S3

@@ -57,6 +57,13 @@ SUBSIGNAL_WEIGHTS = {
 REDDIT_DELAY = 1.0
 YOUTUBE_DELAY = 0.5
 
+# YouTube Data API quota. A search.list call costs 100 units; the free tier is
+# 10,000 units/day. We cap spend per run (env-overridable, with headroom under
+# the daily limit) and back off cleanly when exhausted - the persistent cache
+# means each subsequent run fills in more uncached (model, quarter) keys.
+YOUTUBE_SEARCH_UNIT_COST = 100
+YOUTUBE_DEFAULT_QUOTA_BUDGET = 9000
+
 
 # ---------------------------------------------------------------------------
 # Period helpers - the pipeline labels its grain "quarter" but actually uses
@@ -279,10 +286,18 @@ class YouTubeUploadsCollector:
     Returns per (make, model, period): {'uploads': int}
     """
 
-    def __init__(self, api_key: Optional[str], cache: SocialCache):
+    def __init__(self, api_key: Optional[str], cache: SocialCache,
+                 quota_budget: Optional[int] = None):
         self.api_key = api_key or os.environ.get("YOUTUBE_API_KEY")
         self.cache = cache
         self.youtube = None
+        # Per-run quota budget (units). Env override wins, else the default.
+        if quota_budget is None:
+            quota_budget = int(os.environ.get("YOUTUBE_QUOTA_BUDGET",
+                                              YOUTUBE_DEFAULT_QUOTA_BUDGET))
+        self.quota_budget = quota_budget
+        self.quota_used = 0
+        self._exhausted_warned = False
         self._init_youtube()
 
     def _init_youtube(self):
@@ -304,7 +319,16 @@ class YouTubeUploadsCollector:
         query = f"{make} {model}".strip()
         cached = self.cache.get("youtube_uploads", query, period)
         if cached is not None:
-            return cached
+            return cached  # cache hits never spend quota
+
+        # Quota guard: stop calling once the per-run budget is spent. Remaining
+        # uncached keys simply drop this run and get picked up next run.
+        if self.quota_used + YOUTUBE_SEARCH_UNIT_COST > self.quota_budget:
+            if not self._exhausted_warned:
+                print(f"  YouTube: quota budget reached ({self.quota_used}/{self.quota_budget} units) "
+                      f"- remaining uncached models deferred to next run")
+                self._exhausted_warned = True
+            return None
 
         start, end = period_bounds(period)
         if start is None:
@@ -320,12 +344,21 @@ class YouTubeUploadsCollector:
                 publishedAfter=to_rfc3339(start),
                 publishedBefore=to_rfc3339(end),
             ).execute()
+            self.quota_used += YOUTUBE_SEARCH_UNIT_COST
             uploads = int(resp.get("pageInfo", {}).get("totalResults", 0))
             result = {"uploads": uploads}
             self.cache.set("youtube_uploads", query, period, result)
             return result
         except Exception as e:
-            print(f"    YouTube error for '{query}' {period}: {e}")
+            # quotaExceeded surfaces here too - count it as spent and stop trying.
+            msg = str(e)
+            if "quota" in msg.lower():
+                self.quota_used = self.quota_budget
+                if not self._exhausted_warned:
+                    print(f"    YouTube: API reported quota exhausted - deferring remaining models")
+                    self._exhausted_warned = True
+            else:
+                print(f"    YouTube error for '{query}' {period}: {e}")
             return None
 
 
