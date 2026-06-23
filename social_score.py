@@ -8,19 +8,24 @@ with a *measured* composite computed per ``manufacturer x model x quarter``.
 
 The composite is a weighted blend of five percentile-ranked sub-signals:
 
-    social_mentions        ~0.30  Reddit + enthusiast forum mention volume
-    social_engagement_rate ~0.25  interactions / reach (Reddit + IG/TikTok)
-    social_sov             ~0.20  model mentions / segment mentions that quarter
-    social_video_uploads   ~0.15  new videos that quarter (YouTube + TikTok uploads)
-    social_sentiment       ~0.10  share of positive+neutral mentions (VADER NLP)
+    social_mentions        0.25  Reddit + enthusiast forum mention volume
+    social_engagement_rate 0.12  interactions / reach (Reddit + IG/TikTok)
+    social_sov             0.08  model mentions / segment mentions that quarter
+    social_video_views     0.50  views on the quarter's uploads (YouTube + TikTok)
+    social_sentiment       0.05  share of positive+neutral mentions (VADER NLP)
+
+These are rebalanced from the literature defaults (0.30/0.25/0.20/0.15/0.10) so
+no single platform dominates: with only Reddit + YouTube wired, the literature
+weights placed ~85% on Reddit (mentions, SoV and sentiment all derive from the
+same Reddit text). The split above is ~50% Reddit-sourced / ~50% YouTube.
 
 Design principles (see docs/social-score-methodology.md in the app repo):
 
   * Mid-rank percentile across ALL (model x quarter) observations, matching the
     pattern the MII front-end already uses.
-  * Avoid double-counting existing MII inputs: we use YouTube *upload counts*
-    (not view totals, which are a separate MII input) and Reddit/forum/IG
-    *mentions* (not the on-listing BaT comment count, also a separate input).
+  * Avoid double-counting the on-listing BaT comment count (a separate MII
+    input); social mentions come from Reddit/forums/IG instead. The video
+    sub-signal uses views on each quarter's *new uploads* (per-quarter impact).
   * Missing sub-signals are DROPPED from a row's weighted sum and the remaining
     weights are renormalized. We never impute a brand default.
   * Everything is keyed on the same manufacturer + model + quarter grain as the
@@ -45,12 +50,16 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Composite weights (renormalized per-row over whichever sub-signals exist)
 # ---------------------------------------------------------------------------
+# Rebalanced from the literature defaults (0.30/0.25/0.20/0.15/0.10) so a single
+# platform can't dominate: with only Reddit + YouTube wired, the literature
+# weights put ~85% on Reddit because mentions, SoV and sentiment all derive from
+# the same Reddit text corpus. This split is ~50% Reddit-sourced / ~50% YouTube.
 SUBSIGNAL_WEIGHTS = {
-    "social_mentions": 0.30,
-    "social_engagement_rate": 0.25,
-    "social_sov": 0.20,
-    "social_video_views": 0.15,
-    "social_sentiment": 0.10,
+    "social_mentions": 0.25,
+    "social_engagement_rate": 0.12,
+    "social_sov": 0.08,
+    "social_video_views": 0.50,
+    "social_sentiment": 0.05,
 }
 
 # Rate-limit spacing (seconds)
