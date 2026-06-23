@@ -53,7 +53,7 @@ def synthetic_frame(seed: int = 7) -> pd.DataFrame:
                 "segment": get_segment(mk),
                 "social_mentions": max(0.0, base * drift + rng.normal(0, 20)),
                 "social_engagement_rate": rng.uniform(0.01, 0.4),
-                "social_video_uploads": float(rng.integers(0, 300)),
+                "social_video_views": float(rng.integers(0, 5_000_000)),
                 "social_sentiment": rng.uniform(0.4, 1.0),
             })
     return pd.DataFrame(recs)

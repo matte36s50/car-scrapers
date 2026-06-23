@@ -49,7 +49,7 @@ SUBSIGNAL_WEIGHTS = {
     "social_mentions": 0.30,
     "social_engagement_rate": 0.25,
     "social_sov": 0.20,
-    "social_video_uploads": 0.15,
+    "social_video_views": 0.15,
     "social_sentiment": 0.10,
 }
 
@@ -62,7 +62,9 @@ YOUTUBE_DELAY = 0.5
 # the daily limit) and back off cleanly when exhausted - the persistent cache
 # means each subsequent run fills in more uncached (model, quarter) keys.
 YOUTUBE_SEARCH_UNIT_COST = 100
+YOUTUBE_VIDEOS_UNIT_COST = 1   # videos.list (statistics) to total views of the quarter's uploads
 YOUTUBE_DEFAULT_QUOTA_BUDGET = 9000
+YOUTUBE_MAX_VIDEOS_PER_PERIOD = 50  # videos sampled per (model, quarter) for the view total
 
 
 # ---------------------------------------------------------------------------
@@ -276,14 +278,19 @@ class RedditForumCollector:
         return result
 
 
-class YouTubeUploadsCollector:
-    """Count of NEW videos uploaded about a model in a given period.
+class YouTubeVideoCollector:
+    """Social video impact for a model in a given period.
 
-    Uses the YouTube Data API search.list with publishedAfter/Before bounded to
-    the period window. We deliberately use upload *count* (pageInfo.totalResults)
-    rather than view totals, because view totals are already a separate MII input.
+    The scored sub-signal is *views on the videos uploaded that period* - i.e.
+    how much attention a model's NEW content pulled in that quarter. This is
+    genuinely per-period (the upload window gives recency) and measures impact
+    (views), unlike an all-time view total which is constant across quarters.
 
-    Returns per (make, model, period): {'uploads': int}
+    Uses search.list (publishedAfter/Before bounded to the period) to find up to
+    YOUTUBE_MAX_VIDEOS_PER_PERIOD of the period's uploads, then videos.list to
+    total their view counts. Also returns the upload count for auditability.
+
+    Returns per (make, model, period): {'uploads': int, 'views': int}
     """
 
     def __init__(self, api_key: Optional[str], cache: SocialCache,
@@ -317,7 +324,7 @@ class YouTubeUploadsCollector:
         if not self.youtube:
             return None
         query = f"{make} {model}".strip()
-        cached = self.cache.get("youtube_uploads", query, period)
+        cached = self.cache.get("youtube_video", query, period)
         if cached is not None:
             return cached  # cache hits never spend quota
 
@@ -336,18 +343,37 @@ class YouTubeUploadsCollector:
 
         try:
             time.sleep(YOUTUBE_DELAY)
-            resp = self.youtube.search().list(
+            search = self.youtube.search().list(
                 q=query,
                 part="id",
                 type="video",
-                maxResults=1,  # we only need pageInfo.totalResults
+                order="relevance",
+                maxResults=YOUTUBE_MAX_VIDEOS_PER_PERIOD,
                 publishedAfter=to_rfc3339(start),
                 publishedBefore=to_rfc3339(end),
             ).execute()
             self.quota_used += YOUTUBE_SEARCH_UNIT_COST
-            uploads = int(resp.get("pageInfo", {}).get("totalResults", 0))
-            result = {"uploads": uploads}
-            self.cache.set("youtube_uploads", query, period, result)
+            uploads = int(search.get("pageInfo", {}).get("totalResults", 0))
+
+            video_ids = [
+                it["id"]["videoId"]
+                for it in search.get("items", [])
+                if it.get("id", {}).get("videoId")
+            ]
+
+            # Total the view counts of those uploads (1 quota unit, batched).
+            views = 0
+            if video_ids:
+                time.sleep(YOUTUBE_DELAY)
+                stats = self.youtube.videos().list(
+                    part="statistics", id=",".join(video_ids)
+                ).execute()
+                self.quota_used += YOUTUBE_VIDEOS_UNIT_COST
+                for v in stats.get("items", []):
+                    views += int(v.get("statistics", {}).get("viewCount", 0) or 0)
+
+            result = {"uploads": uploads, "views": views}
+            self.cache.set("youtube_video", query, period, result)
             return result
         except Exception as e:
             # quotaExceeded surfaces here too - count it as spent and stop trying.
@@ -474,10 +500,12 @@ def compute_social_scores(
     Returns:
         DataFrame keyed on [manufacturer, model, quarter] with columns:
             social_mentions, social_engagement_rate, social_sov,
-            social_video_uploads, social_sentiment, social_score
+            social_video_views, social_sentiment, social_score
+        plus social_video_uploads (audit-only: upload count behind the views).
         Raw sub-signals are emitted for auditability; social_score is the
         percentile-ranked, renormalized composite in [0, 100] (NaN where no
-        sub-signal could be measured).
+        sub-signal could be measured). The scored video sub-signal is views on
+        the period's uploads (impact), not the all-time view total.
     """
     print("\n" + "=" * 80)
     print("COMPUTING MEASURED SOCIAL SCORE COMPOSITE")
@@ -490,7 +518,7 @@ def compute_social_scores(
 
     cache = SocialCache(cache_file=cache_file)
     reddit = RedditForumCollector(cache)
-    youtube = YouTubeUploadsCollector(youtube_api_key, cache)
+    youtube = YouTubeVideoCollector(youtube_api_key, cache)
     igtt = InstagramTikTokCollector(cache)
     sentiment = SentimentAnalyzer()
 
@@ -520,7 +548,14 @@ def compute_social_scores(
 
         engagement = (interactions / reach) if reach > 0 else float("nan")
 
+        # Scored video sub-signal = views on the period's uploads (impact).
+        # Upload count is retained alongside it purely for auditability.
+        views = float("nan")
         uploads = float("nan")
+        yt_views = y.get("views") if y is not None else None
+        ig_views = ig.get("video_views") if ig is not None else None
+        if yt_views is not None or ig_views is not None:
+            views = (yt_views or 0) + (ig_views or 0)
         yt_up = y.get("uploads") if y is not None else None
         ig_up = ig.get("video_uploads") if ig is not None else None
         if yt_up is not None or ig_up is not None:
@@ -533,6 +568,7 @@ def compute_social_scores(
             "segment": get_segment(make),
             "social_mentions": mentions,
             "social_engagement_rate": engagement,
+            "social_video_views": views,
             "social_video_uploads": uploads,
             "social_sentiment": sent,
             "_mention_count": 0 if pd.isna(mentions) else mentions,
@@ -595,7 +631,7 @@ if __name__ == "__main__":
     df["segment"] = df["manufacturer"].map(get_segment)
     df["social_mentions"] = rng.integers(1, 500, len(df)).astype(float)
     df["social_engagement_rate"] = rng.random(len(df))
-    df["social_video_uploads"] = rng.integers(0, 200, len(df)).astype(float)
+    df["social_video_views"] = rng.integers(0, 5_000_000, len(df)).astype(float)
     df["social_sentiment"] = rng.random(len(df))
     seg_totals = df.groupby(["segment", "quarter"])["social_mentions"].transform("sum")
     df["social_sov"] = df["social_mentions"] / seg_totals

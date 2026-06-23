@@ -518,8 +518,9 @@ def calculate_mii_scores(df):
             grouped = grouped.merge(
                 social_composite[['manufacturer', 'model', 'quarter',
                                   'social_mentions', 'social_engagement_rate',
-                                  'social_sov', 'social_video_uploads',
-                                  'social_sentiment', 'social_score']],
+                                  'social_sov', 'social_video_views',
+                                  'social_video_uploads', 'social_sentiment',
+                                  'social_score']],
                 on=['manufacturer', 'model', 'quarter'],
                 how='left'
             )
