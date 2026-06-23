@@ -486,25 +486,22 @@ def calculate_mii_scores(df):
                 sample_size=SOCIAL_METRICS_SAMPLE
             )
 
-            # Merge Google Trends + YouTube-views metrics (separate MII inputs)
-            # on the manufacturer+model grain. NOTE: social_score is NO LONGER
-            # taken from here - the legacy value was a hardcoded brand->score
-            # lookup. It is replaced below by a measured composite.
+            # Merge Google Trends metrics (a separate 15% MII input) on the
+            # manufacturer+model grain. NOTE: youtube_total_views and social_score
+            # are NO LONGER taken from here - both were non-quarter / hardcoded.
+            # They are set below from the per-quarter measured composite.
             grouped = grouped.merge(
                 social_df[['manufacturer', 'model', 'google_trends_interest',
                           'google_trends_pct', 'google_trends_direction',
-                          'google_trends_source', 'youtube_total_views',
-                          'youtube_source']],
+                          'google_trends_source']],
                 on=['manufacturer', 'model'],
                 how='left'
             )
 
-            # Fill NaN with fallback estimates (Trends/YouTube-views only)
+            # Fill NaN with fallback estimates (Google Trends only)
             grouped['google_trends_interest'] = grouped['google_trends_interest'].fillna(30)
             grouped['google_trends_pct'] = grouped['google_trends_pct'].fillna(0)
             grouped['google_trends_source'] = grouped['google_trends_source'].fillna('estimate')
-            grouped['youtube_total_views'] = grouped['youtube_total_views'].fillna(10000)
-            grouped['youtube_source'] = grouped['youtube_source'].fillna('estimate')
 
             # ---- Measured social_score composite (per manufacturer x model x quarter) ----
             # Replaces the broken hardcoded brand->score lookup with a weighted
@@ -528,9 +525,24 @@ def calculate_mii_scores(df):
             # measurable sub-signal stay NaN; the MII blend renormalizes the
             # remaining weights so unmeasured models are not penalized.
 
+            # Per-quarter YouTube views (10% MII input). Sourced from the same
+            # per-quarter measure the composite collects (views on the quarter's
+            # uploads), so this input now varies over time instead of being a
+            # single non-quarter snapshot. Left NaN where YouTube wasn't
+            # measurable - the MII blend renormalizes rather than imputing.
+            grouped['youtube_total_views'] = grouped['social_video_views']
+            grouped['youtube_source'] = grouped['youtube_total_views'].notna().map(
+                {True: 'measured_quarter', False: 'missing'}
+            )
+
             print(f"✅ Social metrics collected and merged")
             print(f"   Google Trends range: {grouped['google_trends_interest'].min():.1f} - {grouped['google_trends_interest'].max():.1f}")
-            print(f"   YouTube views range: {grouped['youtube_total_views'].min():,.0f} - {grouped['youtube_total_views'].max():,.0f}")
+            _yt_measured = grouped['youtube_total_views'].notna().sum()
+            if _yt_measured:
+                print(f"   YouTube per-quarter views: {grouped['youtube_total_views'].min():,.0f} - "
+                      f"{grouped['youtube_total_views'].max():,.0f} ({_yt_measured:,}/{len(grouped):,} rows measured)")
+            else:
+                print(f"   YouTube per-quarter views: none measurable (input renormalized out of MII)")
             _measured = grouped['social_score'].notna().sum()
             if _measured:
                 print(f"   Social score: {grouped['social_score'].nunique():,} distinct values, "
