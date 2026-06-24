@@ -8,3 +8,6 @@ numpy==1.24.4
 # Social metrics dependencies
 pytrends==4.9.2
 google-api-python-client==2.111.0
+# Social score composite dependencies
+praw==7.7.1               # Reddit mention volume / engagement
+vaderSentiment==3.3.2     # sentiment sub-signal (local, no API)

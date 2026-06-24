@@ -7,6 +7,7 @@ import boto3
 from botocore.exceptions import NoCredentialsError
 from manufacturer_cleanup import clean_manufacturer_column, get_manufacturer_stats
 from social_metrics import collect_social_metrics_for_mii, SocialMetricsCollector
+from social_score import compute_social_scores
 
 # ============================================================================
 # CONFIGURATION
@@ -485,28 +486,71 @@ def calculate_mii_scores(df):
                 sample_size=SOCIAL_METRICS_SAMPLE
             )
 
-            # Merge social metrics with grouped data
+            # Merge Google Trends metrics (a separate 15% MII input) on the
+            # manufacturer+model grain. NOTE: youtube_total_views and social_score
+            # are NO LONGER taken from here - both were non-quarter / hardcoded.
+            # They are set below from the per-quarter measured composite.
             grouped = grouped.merge(
                 social_df[['manufacturer', 'model', 'google_trends_interest',
                           'google_trends_pct', 'google_trends_direction',
-                          'google_trends_source', 'youtube_total_views',
-                          'youtube_source', 'social_score']],
+                          'google_trends_source']],
                 on=['manufacturer', 'model'],
                 how='left'
             )
 
-            # Fill NaN with fallback estimates
+            # Fill NaN with fallback estimates (Google Trends only)
             grouped['google_trends_interest'] = grouped['google_trends_interest'].fillna(30)
             grouped['google_trends_pct'] = grouped['google_trends_pct'].fillna(0)
             grouped['google_trends_source'] = grouped['google_trends_source'].fillna('estimate')
-            grouped['youtube_total_views'] = grouped['youtube_total_views'].fillna(10000)
-            grouped['youtube_source'] = grouped['youtube_source'].fillna('estimate')
-            grouped['social_score'] = grouped['social_score'].fillna(25)
+
+            # ---- Measured social_score composite (per manufacturer x model x quarter) ----
+            # Replaces the broken hardcoded brand->score lookup with a weighted
+            # blend of percentile-ranked sub-signals. Keyed on the same grain as
+            # the rest of the pipeline so it lines up with mii_results.
+            social_composite = compute_social_scores(
+                grouped[['manufacturer', 'model', 'quarter']].drop_duplicates(),
+                youtube_api_key=YOUTUBE_API_KEY,
+                sample_size=SOCIAL_METRICS_SAMPLE,
+            )
+            grouped = grouped.merge(
+                social_composite[['manufacturer', 'model', 'quarter',
+                                  'social_mentions', 'social_engagement_rate',
+                                  'social_sov', 'social_video_views',
+                                  'social_video_uploads', 'social_sentiment',
+                                  'social_score']],
+                on=['manufacturer', 'model', 'quarter'],
+                how='left'
+            )
+            # IMPORTANT: do NOT impute a default for social_score. Rows with no
+            # measurable sub-signal stay NaN; the MII blend renormalizes the
+            # remaining weights so unmeasured models are not penalized.
+
+            # Per-quarter YouTube views (10% MII input). Sourced from the same
+            # per-quarter measure the composite collects (views on the quarter's
+            # uploads), so this input now varies over time instead of being a
+            # single non-quarter snapshot. Left NaN where YouTube wasn't
+            # measurable - the MII blend renormalizes rather than imputing.
+            grouped['youtube_total_views'] = grouped['social_video_views']
+            grouped['youtube_source'] = grouped['youtube_total_views'].notna().map(
+                {True: 'measured_quarter', False: 'missing'}
+            )
 
             print(f"✅ Social metrics collected and merged")
             print(f"   Google Trends range: {grouped['google_trends_interest'].min():.1f} - {grouped['google_trends_interest'].max():.1f}")
-            print(f"   YouTube views range: {grouped['youtube_total_views'].min():,.0f} - {grouped['youtube_total_views'].max():,.0f}")
-            print(f"   Social score range: {grouped['social_score'].min():.1f} - {grouped['social_score'].max():.1f}")
+            _yt_measured = grouped['youtube_total_views'].notna().sum()
+            if _yt_measured:
+                print(f"   YouTube per-quarter views: {grouped['youtube_total_views'].min():,.0f} - "
+                      f"{grouped['youtube_total_views'].max():,.0f} ({_yt_measured:,}/{len(grouped):,} rows measured)")
+            else:
+                print(f"   YouTube per-quarter views: none measurable (input renormalized out of MII)")
+            _measured = grouped['social_score'].notna().sum()
+            if _measured:
+                print(f"   Social score: {grouped['social_score'].nunique():,} distinct values, "
+                      f"range {grouped['social_score'].min():.1f} - {grouped['social_score'].max():.1f} "
+                      f"({_measured:,}/{len(grouped):,} rows measured)")
+            else:
+                print(f"   Social score: no sub-signals measurable in this environment "
+                      f"(social component renormalized out of MII)")
 
             use_social = True
         except Exception as e:
@@ -595,11 +639,14 @@ def calculate_mii_scores(df):
    Instagram:      10%
    Age (classic):   5%"""
 
-    grouped['mii_score'] = sum(
-        grouped[metric] * weight
-        for metric, weight in weights.items()
-        if metric in grouped.columns
-    ) * 100
+    # Weighted blend with per-row renormalization: if a normalized component is
+    # missing for a row (e.g. social_score could not be measured), drop its
+    # weight and renormalize the rest so the row is scored on what it has,
+    # rather than imputing a default.
+    active = {m: w for m, w in weights.items() if m in grouped.columns}
+    weighted_sum = sum(grouped[m].fillna(0) * w for m, w in active.items())
+    present_weight = sum(grouped[m].notna() * w for m, w in active.items())
+    grouped['mii_score'] = (weighted_sum / present_weight.replace(0, np.nan)) * 100
 
     grouped['mii_score'] = grouped['mii_score'].round(2)
     grouped = grouped.sort_values('mii_score', ascending=False)
