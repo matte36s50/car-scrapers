@@ -6,26 +6,28 @@ Replaces the legacy hardcoded brand->score lookup (the source of the broken
 `social_score`: only 19 distinct values, pinned per brand, frozen over time)
 with a *measured* composite computed per ``manufacturer x model x quarter``.
 
-The composite is a weighted blend of five percentile-ranked sub-signals:
+The composite is a weighted blend of four percentile-ranked "chatter" signals:
 
-    social_mentions        0.25  Reddit + enthusiast forum mention volume
-    social_engagement_rate 0.12  interactions / reach (Reddit + IG/TikTok)
-    social_sov             0.08  model mentions / segment mentions that quarter
-    social_video_views     0.50  views on the quarter's uploads (YouTube + TikTok)
-    social_sentiment       0.05  share of positive+neutral mentions (VADER NLP)
+    social_mentions        0.35  Reddit + enthusiast forum mention volume
+    social_engagement_rate 0.29  interactions / reach (Reddit + IG/TikTok)
+    social_sov             0.24  model mentions / segment mentions that quarter
+    social_sentiment       0.12  share of positive+neutral mentions (VADER NLP)
 
-These are rebalanced from the literature defaults (0.30/0.25/0.20/0.15/0.10) so
-no single platform dominates: with only Reddit + YouTube wired, the literature
-weights placed ~85% on Reddit (mentions, SoV and sentiment all derive from the
-same Reddit text). The split above is ~50% Reddit-sourced / ~50% YouTube.
+These are the literature defaults for the four chatter signals (0.30/0.25/0.20/
+0.10), renormalized to sum to 1.0 after the video sub-signal was removed.
+
+Video VIEWS are intentionally excluded from this composite: they already feed
+the MII directly as the standalone `youtube_total_views` input, so blending them
+here too would double-count the same signal. Views are still COLLECTED (the
+standalone input reads them and they're emitted for audit) - just not scored.
 
 Design principles (see docs/social-score-methodology.md in the app repo):
 
   * Mid-rank percentile across ALL (model x quarter) observations, matching the
     pattern the MII front-end already uses.
-  * Avoid double-counting the on-listing BaT comment count (a separate MII
-    input); social mentions come from Reddit/forums/IG instead. The video
-    sub-signal uses views on each quarter's *new uploads* (per-quarter impact).
+  * Avoid double-counting other MII inputs: social mentions come from
+    Reddit/forums/IG (not the on-listing BaT comment count), and video views are
+    left to the standalone `youtube_total_views` input rather than scored here.
   * Missing sub-signals are DROPPED from a row's weighted sum and the remaining
     weights are renormalized. We never impute a brand default.
   * Everything is keyed on the same manufacturer + model + quarter grain as the
@@ -50,16 +52,21 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Composite weights (renormalized per-row over whichever sub-signals exist)
 # ---------------------------------------------------------------------------
-# Rebalanced from the literature defaults (0.30/0.25/0.20/0.15/0.10) so a single
-# platform can't dominate: with only Reddit + YouTube wired, the literature
-# weights put ~85% on Reddit because mentions, SoV and sentiment all derive from
-# the same Reddit text corpus. This split is ~50% Reddit-sourced / ~50% YouTube.
+# The composite scores only the "social chatter" sub-signals. YouTube/TikTok
+# VIEWS are deliberately NOT scored here: views already feed the MII directly as
+# the standalone `youtube_total_views` input, so scoring them in the composite
+# too would double-count the same signal. We still COLLECT views (the standalone
+# input reads them) - they're just not blended into social_score.
+#
+# Weights are the literature defaults for the four chatter signals (originally
+# 0.30/0.25/0.20/0.10 alongside a 0.15 video slot), renormalized to sum to 1.0
+# now that the video slot is gone. Per-row renormalization further adjusts these
+# whenever a sub-signal is missing for a given (model, quarter).
 SUBSIGNAL_WEIGHTS = {
-    "social_mentions": 0.25,
-    "social_engagement_rate": 0.12,
-    "social_sov": 0.08,
-    "social_video_views": 0.50,
-    "social_sentiment": 0.05,
+    "social_mentions": 0.35,
+    "social_engagement_rate": 0.29,
+    "social_sov": 0.24,
+    "social_sentiment": 0.12,
 }
 
 # Rate-limit spacing (seconds)
@@ -509,12 +516,13 @@ def compute_social_scores(
     Returns:
         DataFrame keyed on [manufacturer, model, quarter] with columns:
             social_mentions, social_engagement_rate, social_sov,
-            social_video_views, social_sentiment, social_score
-        plus social_video_uploads (audit-only: upload count behind the views).
-        Raw sub-signals are emitted for auditability; social_score is the
-        percentile-ranked, renormalized composite in [0, 100] (NaN where no
-        sub-signal could be measured). The scored video sub-signal is views on
-        the period's uploads (impact), not the all-time view total.
+            social_sentiment, social_score
+        plus social_video_views and social_video_uploads (emitted for the
+        standalone youtube_total_views MII input and for audit; NOT scored into
+        social_score). Raw sub-signals are emitted for auditability; social_score
+        is the percentile-ranked, renormalized composite in [0, 100] (NaN where
+        no chatter sub-signal could be measured). Video views are the views on
+        the period's uploads (per-quarter impact), not the all-time view total.
     """
     print("\n" + "=" * 80)
     print("COMPUTING MEASURED SOCIAL SCORE COMPOSITE")
@@ -557,8 +565,9 @@ def compute_social_scores(
 
         engagement = (interactions / reach) if reach > 0 else float("nan")
 
-        # Scored video sub-signal = views on the period's uploads (impact).
-        # Upload count is retained alongside it purely for auditability.
+        # Video views = views on the period's uploads (per-quarter impact).
+        # Collected for the standalone youtube_total_views MII input (not scored
+        # into the composite); upload count is retained purely for auditability.
         views = float("nan")
         uploads = float("nan")
         yt_views = y.get("views") if y is not None else None
@@ -640,7 +649,6 @@ if __name__ == "__main__":
     df["segment"] = df["manufacturer"].map(get_segment)
     df["social_mentions"] = rng.integers(1, 500, len(df)).astype(float)
     df["social_engagement_rate"] = rng.random(len(df))
-    df["social_video_views"] = rng.integers(0, 5_000_000, len(df)).astype(float)
     df["social_sentiment"] = rng.random(len(df))
     seg_totals = df.groupby(["segment", "quarter"])["social_mentions"].transform("sum")
     df["social_sov"] = df["social_mentions"] / seg_totals

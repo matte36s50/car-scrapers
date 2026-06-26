@@ -526,10 +526,12 @@ def calculate_mii_scores(df):
             # remaining weights so unmeasured models are not penalized.
 
             # Per-quarter YouTube views (10% MII input). Sourced from the same
-            # per-quarter measure the composite collects (views on the quarter's
+            # per-quarter measure social_score collects (views on the quarter's
             # uploads), so this input now varies over time instead of being a
-            # single non-quarter snapshot. Left NaN where YouTube wasn't
-            # measurable - the MII blend renormalizes rather than imputing.
+            # single non-quarter snapshot. This is the SOLE place views enter the
+            # MII - they are deliberately not scored into social_score, to avoid
+            # double-counting. Left NaN where YouTube wasn't measurable - the MII
+            # blend renormalizes rather than imputing.
             grouped['youtube_total_views'] = grouped['social_video_views']
             grouped['youtube_source'] = grouped['youtube_total_views'].notna().map(
                 {True: 'measured_quarter', False: 'missing'}
