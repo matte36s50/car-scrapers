@@ -92,6 +92,11 @@ jobs:
         echo "Starting Cars & Bids scraper..."
         echo "=========================================="
         python cnb_scraper.py || echo "CNB scraper encountered errors"
+      env:
+        # Canonical-store dual-write (Phase 2). Leave these secrets unset to
+        # keep the scraper CSV-only; set them to mirror into the store.
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       continue-on-error: true
       
     - name: Upload CNB results to S3
@@ -116,6 +121,11 @@ jobs:
         echo "Starting Bring a Trailer scraper..."
         echo "=========================================="
         python bat_scraper.py || echo "BAT scraper encountered errors"
+      env:
+        # Canonical-store dual-write (Phase 2). Leave these secrets unset to
+        # keep the scraper CSV-only; set them to mirror into the store.
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       continue-on-error: true
       
     - name: Upload BAT results to S3

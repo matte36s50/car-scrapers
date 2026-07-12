@@ -74,11 +74,17 @@ jobs:
     - name: Run BAT scraper
       if: ${{ github.event.inputs.source == 'bat' || github.event.inputs.source == 'both' }}
       run: python bat_scraper.py ${{ steps.args.outputs.cli }}
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       continue-on-error: true
 
     - name: Run CNB scraper
       if: ${{ github.event.inputs.source == 'cnb' || github.event.inputs.source == 'both' }}
       run: python cnb_scraper.py ${{ steps.args.outputs.cli }}
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       continue-on-error: true
 
     - name: Summary

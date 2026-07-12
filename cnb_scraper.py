@@ -626,6 +626,12 @@ def main(start_date=None, end_date=None, max_auctions=None):
         print(f"{'='*60}")
     
     if new_rows:
+        # Dual-write this run's new records to the canonical store (no-op
+        # unless SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY are set; never breaks
+        # the CSV path)
+        import canonical_store
+        canonical_store.push_cnb_records(new_rows)
+
         print(f"\n💾 Saving {len(new_rows)} new rows...")
         new_df = pd.DataFrame(new_rows)
         

@@ -666,6 +666,11 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
     combined_df.to_csv("bat.csv", index=False)
     print(f"Saved to bat.csv")
 
+    # Dual-write this run's new records to the canonical store (no-op unless
+    # SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY are set; never breaks the CSV path)
+    import canonical_store
+    canonical_store.push_bat_records(new_data)
+
     # Show summary
     print(f"\n" + "=" * 60)
     print("=== SUMMARY ===")
