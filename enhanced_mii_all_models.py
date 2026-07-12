@@ -398,9 +398,17 @@ def clean_and_process_data(df):
     
     df['model'] = df['model_clean']
     
-    # Filter: Only sold auctions with valid prices
+    # Filter: Only sold auctions with valid prices. The sold check matters:
+    # for reserve-not-met listings sale_amount holds the losing high bid, and
+    # without it those flow into the index's price averages as if they were
+    # sales.
+    if 'sold' in df.columns:
+        rnm_count = int((df['sold'] != 1).sum())
+        if rnm_count > 0:
+            print(f"\n⚠️  Excluding {rnm_count:,} non-sold records (reserve not met / unknown outcome)")
+        df = df[df['sold'] == 1]
     df = df[
-        (df['price'].notna()) & 
+        (df['price'].notna()) &
         (df['price'] > 100) &
         (df['price'] < 10_000_000)
     ].copy()
@@ -416,8 +424,11 @@ def clean_and_process_data(df):
     if valid_dates == 0:
         raise Exception("❌ CRITICAL ERROR: No valid dates found! Cannot create quarters.")
     
-    # Create quarter only for rows with valid dates
-    df['quarter'] = df['date'].dt.to_period('M').astype(str)
+    # Create quarter only for rows with valid dates. Real quarters ('2025Q4'),
+    # not months: the Windsor pipeline, the mii-reports site, and
+    # validate_quarter all use the quarterly format, and per-quarter
+    # normalization below assumes quarter-sized buckets.
+    df['quarter'] = df['date'].dt.to_period('Q').astype(str)
     
     # Show quarter distribution
     print(f"\n📊 Quarter distribution:")
