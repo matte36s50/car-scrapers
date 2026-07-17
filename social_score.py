@@ -6,13 +6,15 @@ Replaces the legacy hardcoded brand->score lookup (the source of the broken
 `social_score`: only 19 distinct values, pinned per brand, frozen over time)
 with a *measured* composite computed per ``manufacturer x model x quarter``.
 
-The composite is a weighted blend of five percentile-ranked sub-signals:
+The composite is a weighted blend of six percentile-ranked sub-signals:
 
-    social_mentions        0.25  Reddit + enthusiast forum mention volume
-    social_engagement_rate 0.12  interactions / reach (Reddit + IG/TikTok)
-    social_sov             0.08  model mentions / segment mentions that quarter
-    social_video_views     0.50  views on the quarter's uploads (YouTube + TikTok)
-    social_sentiment       0.05  share of positive+neutral mentions (VADER NLP)
+    social_mentions        0.20  Reddit + enthusiast forum mention volume
+    social_engagement_rate 0.10  interactions / reach (Reddit + IG/TikTok)
+    social_sov             0.06  model mentions / segment mentions that quarter
+    social_video_views     0.40  views on the quarter's uploads (YouTube + TikTok)
+    social_sentiment       0.04  share of positive+neutral mentions (VADER NLP)
+    social_wiki_attention  0.20  Wikipedia article pageviews in the period
+                                 (credential-free: guarantees baseline coverage)
 
 These are rebalanced from the literature defaults (0.30/0.25/0.20/0.15/0.10) so
 no single platform dominates: with only Reddit + YouTube wired, the literature
@@ -55,16 +57,22 @@ import pandas as pd
 # weights put ~85% on Reddit because mentions, SoV and sentiment all derive from
 # the same Reddit text corpus. This split is ~50% Reddit-sourced / ~50% YouTube.
 SUBSIGNAL_WEIGHTS = {
-    "social_mentions": 0.25,
-    "social_engagement_rate": 0.12,
-    "social_sov": 0.08,
-    "social_video_views": 0.50,
-    "social_sentiment": 0.05,
+    "social_mentions": 0.20,
+    "social_engagement_rate": 0.10,
+    "social_sov": 0.06,
+    "social_video_views": 0.40,
+    "social_sentiment": 0.04,
+    # Wikipedia article pageviews for the period. Needs no credentials, so it
+    # guarantees baseline social coverage in environments where the Reddit /
+    # YouTube / IG collectors are unconfigured; the credentialed sub-signals
+    # take over their share of weight wherever they are measured.
+    "social_wiki_attention": 0.20,
 }
 
 # Rate-limit spacing (seconds)
 REDDIT_DELAY = 1.0
 YOUTUBE_DELAY = 0.5
+WIKI_DELAY = 0.15
 
 # YouTube Data API quota. A search.list call costs 100 units; the free tier is
 # 10,000 units/day. We cap spend per run (env-overridable, with headroom under
@@ -427,6 +435,125 @@ class InstagramTikTokCollector:
         return None
 
 
+class WikipediaAttentionCollector:
+    """Wikipedia article pageviews for a model in a given period.
+
+    The one social sub-signal that needs no credentials: the Wikimedia REST
+    pageviews API is free, unauthenticated, and reliable, so this collector
+    guarantees the composite has baseline coverage even in environments where
+    Reddit / YouTube / IG are unconfigured. Mirrors the collector in the app
+    repo's data/pipelines/social_signals.py.
+
+    Resolution (model -> article) uses the MediaWiki search API once per model
+    and is cached; the full monthly pageview series is fetched once per article
+    per run, then summed over each requested period's months locally.
+
+    Returns per (make, model, period): {'views': int} or None.
+    """
+
+    SEARCH_API = "https://en.wikipedia.org/w/api.php"
+    PAGEVIEWS_API = "https://wikimedia.org/api/rest_v1/metrics/pageviews/per-article"
+    SERIES_MONTHS_BACK = 36
+
+    def __init__(self, cache: SocialCache):
+        self.cache = cache
+        self._series_memo = {}  # slug -> {'YYYY-MM': views} for this run
+
+    def _http_json(self, url):
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            "User-Agent": "mii-social-score/1.0 (market-interest-index)"
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return json.load(resp)
+        except Exception:
+            return None
+
+    def _resolve(self, make: str, model: str) -> Optional[str]:
+        """Model -> article slug via search, sanity-checked, cached."""
+        import urllib.parse
+        query = f"{make} {model}".strip()
+        cached = self.cache.get("wiki_slug", query, "static")
+        if cached is not None:
+            return cached.get("slug") or None
+        time.sleep(WIKI_DELAY)
+        data = self._http_json(
+            self.SEARCH_API
+            + "?action=query&list=search&format=json&srlimit=1&srsearch="
+            + urllib.parse.quote(query)
+        )
+        if data is None:
+            # Transient network failure — don't cache, retry next run.
+            return None
+        hits = data.get("query", {}).get("search", [])
+        slug = None
+        if hits:
+            title = hits[0]["title"]
+
+            def toks(s):
+                import re as _re
+                return {t for t in _re.split(r"[^a-z0-9]+", s.lower()) if len(t) > 1}
+
+            # The hit must share a token with the query or it's unrelated.
+            if toks(title) & (toks(make) | toks(model)):
+                slug = title.replace(" ", "_")
+        self.cache.set("wiki_slug", query, "static", {"slug": slug or ""})
+        return slug
+
+    def _series(self, slug: str) -> dict:
+        """Full monthly pageview series for an article, memoized + cached."""
+        if slug in self._series_memo:
+            return self._series_memo[slug]
+        current_month = datetime.now().strftime("%Y-%m")
+        cached = self.cache.get("wiki_series", slug, current_month)
+        if cached is not None:
+            self._series_memo[slug] = cached
+            return cached
+        import urllib.parse
+        today = datetime.now()
+        start = today - timedelta(days=self.SERIES_MONTHS_BACK * 30)
+        url = (f"{self.PAGEVIEWS_API}/en.wikipedia/all-access/all-agents/"
+               f"{urllib.parse.quote(slug)}/monthly/"
+               f"{start.strftime('%Y%m')}010000/{today.strftime('%Y%m%d')}00")
+        time.sleep(WIKI_DELAY)
+        data = self._http_json(url)
+        series = {}
+        for item in (data or {}).get("items", []):
+            ts = item.get("timestamp", "")
+            if len(ts) >= 6:
+                series[f"{ts[:4]}-{ts[4:6]}"] = int(item.get("views", 0))
+        self.cache.set("wiki_series", slug, current_month, series)
+        self._series_memo[slug] = series
+        return series
+
+    def collect(self, make: str, model: str, period: str) -> Optional[dict]:
+        start, end = period_bounds(period)
+        if start is None:
+            return None
+        try:
+            slug = self._resolve(make, model)
+            if not slug:
+                return None
+            series = self._series(slug)
+            if not series:
+                return None
+            views = 0
+            found = False
+            cursor = datetime(start.year, start.month, 1)
+            while cursor < end:
+                key = cursor.strftime("%Y-%m")
+                if key in series:
+                    views += series[key]
+                    found = True
+                cursor = datetime(cursor.year + (cursor.month == 12),
+                                  (cursor.month % 12) + 1, 1)
+            return {"views": views} if found else None
+        except Exception as e:
+            print(f"    Wikipedia error for '{make} {model}' {period}: {e}")
+            return None
+
+
 class SentimentAnalyzer:
     """VADER sentiment over collected mention text.
 
@@ -509,7 +636,8 @@ def compute_social_scores(
     Returns:
         DataFrame keyed on [manufacturer, model, quarter] with columns:
             social_mentions, social_engagement_rate, social_sov,
-            social_video_views, social_sentiment, social_score
+            social_video_views, social_sentiment, social_wiki_attention,
+            social_score
         plus social_video_uploads (audit-only: upload count behind the views).
         Raw sub-signals are emitted for auditability; social_score is the
         percentile-ranked, renormalized composite in [0, 100] (NaN where no
@@ -529,6 +657,7 @@ def compute_social_scores(
     reddit = RedditForumCollector(cache)
     youtube = YouTubeVideoCollector(youtube_api_key, cache)
     igtt = InstagramTikTokCollector(cache)
+    wiki = WikipediaAttentionCollector(cache)
     sentiment = SentimentAnalyzer()
 
     rows = []
@@ -541,6 +670,7 @@ def compute_social_scores(
         r = reddit.collect(make, model, period)
         y = youtube.collect(make, model, period)
         ig = igtt.collect(make, model, period)
+        w = wiki.collect(make, model, period)
 
         # --- raw sub-signals (NaN where the source could not be measured) ---
         mentions = float("nan")
@@ -572,6 +702,8 @@ def compute_social_scores(
 
         sent = sentiment.share_positive_neutral(texts) if texts else float("nan")
 
+        wiki_attention = float(w["views"]) if w is not None else float("nan")
+
         rows.append({
             "manufacturer": make, "model": model, "quarter": period,
             "segment": get_segment(make),
@@ -580,6 +712,7 @@ def compute_social_scores(
             "social_video_views": views,
             "social_video_uploads": uploads,
             "social_sentiment": sent,
+            "social_wiki_attention": wiki_attention,
             "_mention_count": 0 if pd.isna(mentions) else mentions,
         })
 
@@ -642,6 +775,7 @@ if __name__ == "__main__":
     df["social_engagement_rate"] = rng.random(len(df))
     df["social_video_views"] = rng.integers(0, 5_000_000, len(df)).astype(float)
     df["social_sentiment"] = rng.random(len(df))
+    df["social_wiki_attention"] = rng.integers(1_000, 500_000, len(df)).astype(float)
     seg_totals = df.groupby(["segment", "quarter"])["social_mentions"].transform("sum")
     df["social_sov"] = df["social_mentions"] / seg_totals
 

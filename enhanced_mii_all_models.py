@@ -424,11 +424,13 @@ def clean_and_process_data(df):
     if valid_dates == 0:
         raise Exception("❌ CRITICAL ERROR: No valid dates found! Cannot create quarters.")
     
-    # Create quarter only for rows with valid dates. Real quarters ('2025Q4'),
-    # not months: the Windsor pipeline, the mii-reports site, and
-    # validate_quarter all use the quarterly format, and per-quarter
-    # normalization below assumes quarter-sized buckets.
-    df['quarter'] = df['date'].dt.to_period('Q').astype(str)
+    # MONTHLY grain ('2025-05'): restores the finer trend resolution the
+    # dashboard charts had before the July 2026 switch to quarters (which
+    # silently broke the Model Comparison page and halved trend detail).
+    # The column keeps its historical name 'quarter' for schema compatibility;
+    # validate_quarter, the social composite's period_bounds, and the
+    # mii-reports front-end all accept both monthly and quarterly labels.
+    df['quarter'] = df['date'].dt.to_period('M').astype(str)
     
     # Show quarter distribution
     print(f"\n📊 Quarter distribution:")
@@ -509,10 +511,18 @@ def calculate_mii_scores(df):
                 how='left'
             )
 
-            # Fill NaN with fallback estimates (Google Trends only)
-            grouped['google_trends_interest'] = grouped['google_trends_interest'].fillna(30)
+            # Honest Google Trends: keep only values pytrends actually measured.
+            # The old fallback filled a static per-brand estimate table (source
+            # 'estimate', 15 distinct values, frozen over time) into 100% of
+            # rows whenever pytrends failed — a brand badge masquerading as
+            # measurement. Unmeasured rows now stay NaN and the per-row weight
+            # renormalization below scores them on the inputs they do have.
+            measured_gt = grouped['google_trends_source'].eq('google_trends')
+            grouped.loc[~measured_gt, 'google_trends_interest'] = np.nan
             grouped['google_trends_pct'] = grouped['google_trends_pct'].fillna(0)
-            grouped['google_trends_source'] = grouped['google_trends_source'].fillna('estimate')
+            grouped['google_trends_source'] = (
+                grouped['google_trends_source'].fillna('missing').replace({'estimate': 'missing'})
+            )
 
             # ---- Measured social_score composite (per manufacturer x model x quarter) ----
             # Replaces the broken hardcoded brand->score lookup with a weighted
@@ -528,7 +538,7 @@ def calculate_mii_scores(df):
                                   'social_mentions', 'social_engagement_rate',
                                   'social_sov', 'social_video_views',
                                   'social_video_uploads', 'social_sentiment',
-                                  'social_score']],
+                                  'social_wiki_attention', 'social_score']],
                 on=['manufacturer', 'model', 'quarter'],
                 how='left'
             )
@@ -595,11 +605,16 @@ def calculate_mii_scores(df):
         for metric in metrics_to_normalize:
             if metric in grouped.columns:
                 max_val = grouped.loc[quarter_mask, metric].max()
-                if max_val > 0:
+                if pd.notna(max_val) and max_val > 0:
+                    # NaN raw values propagate to NaN normalized values, so the
+                    # per-row weight renormalization can drop them cleanly.
                     grouped.loc[quarter_mask, f'{metric}_normalized'] = \
                         grouped.loc[quarter_mask, metric] / max_val
                 else:
-                    grouped.loc[quarter_mask, f'{metric}_normalized'] = 0
+                    # All-NaN or all-zero bucket: zero only the measured rows,
+                    # never turn missing values into a fake bottom rank.
+                    grouped.loc[quarter_mask, f'{metric}_normalized'] = \
+                        grouped.loc[quarter_mask, metric] * 0
 
         # Normalize age
         if 'age' in grouped.columns:
