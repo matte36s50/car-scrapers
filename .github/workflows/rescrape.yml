@@ -1,0 +1,63 @@
+name: Rescrape Specific BaT Listings
+
+# Repair workflow: re-scrapes the given listing URLs even though they are
+# already in bat.csv, replacing their rows and re-pushing them to the
+# canonical store. Use when BaT changes a result after our first scrape
+# (e.g. a retracted bid or a listing first recorded with the wrong outcome).
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'BaT listing URLs to re-scrape (space-separated)'
+        required: true
+        type: string
+
+jobs:
+  rescrape:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Cache Playwright browsers
+      uses: actions/cache@v3
+      id: playwright-cache
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright-chromium-1091
+        restore-keys: |
+          ${{ runner.os }}-playwright-
+
+    - run: pip install -r requirements.txt
+
+    - name: Install Playwright browsers
+      if: steps.playwright-cache.outputs.cache-hit != 'true'
+      run: playwright install chromium
+
+    - name: Install Playwright deps (cached)
+      if: steps.playwright-cache.outputs.cache-hit == 'true'
+      run: playwright install-deps chromium
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Run BAT scraper in rescrape mode
+      run: python bat_scraper.py --rescrape-urls ${{ github.event.inputs.urls }}
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "Rescraped: ${{ github.event.inputs.urls }}"

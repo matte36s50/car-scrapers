@@ -504,9 +504,14 @@ def parse_auction(browser, url):
     page.close()
     return record
 
-def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
+def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS,
+                rescrape_urls=None):
     """Main scraper function"""
     print(f"\nStarting BAT Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+    if rescrape_urls:
+        print(f"[RESCRAPE MODE] {len(rescrape_urls)} URL(s) supplied — these will be "
+              f"re-scraped even if already in bat.csv, and re-pushed to the canonical store")
 
     is_backfill = bool(start_date or end_date)
     start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
@@ -532,31 +537,40 @@ def run_scraper(start_date=None, end_date=None, max_auctions=MAX_AUCTIONS):
         browser = pw.chromium.launch(headless=True)
         print("Browser launched successfully")
         
-        print("Creating page for URL collection...")
-        collection_page = browser.new_page()
-        print("Page created successfully")
-
         try:
-            print("\n[5/8] Collecting auction URLs...")
-            pairs = collect_auction_urls(
-                collection_page, results_url=RESULTS_URL, max_auctions=max_auctions,
-                start_date=start_date, end_date=end_date
-            )
+            if rescrape_urls:
+                # Repair path: no results-page collection, no already-scraped
+                # filter. drop_duplicates(keep='last') below replaces the old
+                # CSV rows, and the canonical push overwrites the store's copy
+                # — used when BaT changes a result after we first scraped it.
+                print("\n[5/8] Skipping URL collection (rescrape mode)")
+                print(f"\n[6/8] Re-scraping {len(rescrape_urls)} supplied URL(s)...")
+                urls_to_scrape = [(url, None) for url in rescrape_urls]
+            else:
+                print("Creating page for URL collection...")
+                collection_page = browser.new_page()
+                print("Page created successfully")
 
-            # Close the collection page
-            collection_page.close()
-            print("Closed URL collection page")
+                print("\n[5/8] Collecting auction URLs...")
+                pairs = collect_auction_urls(
+                    collection_page, results_url=RESULTS_URL, max_auctions=max_auctions,
+                    start_date=start_date, end_date=end_date
+                )
 
-            print(f"\n[6/8] Filtering URLs...")
-            # Log a sample so we can verify tile-date extraction is working
-            if pairs:
-                sample = [(u, str(d)) for u, d in pairs[:3]]
-                print(f"Sample (url, tile_date) (first 3): {sample}")
-            # Filter out URLs we've already scraped
-            urls_to_scrape = [(url, td) for url, td in pairs if url not in existing_urls]
-            print(f"Total URLs collected: {len(pairs)}")
-            print(f"Already scraped: {len(pairs) - len(urls_to_scrape)}")
-            print(f"New URLs to scrape: {len(urls_to_scrape)}")
+                # Close the collection page
+                collection_page.close()
+                print("Closed URL collection page")
+
+                print(f"\n[6/8] Filtering URLs...")
+                # Log a sample so we can verify tile-date extraction is working
+                if pairs:
+                    sample = [(u, str(d)) for u, d in pairs[:3]]
+                    print(f"Sample (url, tile_date) (first 3): {sample}")
+                # Filter out URLs we've already scraped
+                urls_to_scrape = [(url, td) for url, td in pairs if url not in existing_urls]
+                print(f"Total URLs collected: {len(pairs)}")
+                print(f"Already scraped: {len(pairs) - len(urls_to_scrape)}")
+                print(f"New URLs to scrape: {len(urls_to_scrape)}")
 
             print(f"\n[7/8] Scraping individual auction pages...")
             consecutive_too_old = 0
@@ -709,5 +723,11 @@ if __name__ == "__main__":
                         help="Filter auctions ending on or before this date (backfill mode)")
     parser.add_argument("--max-auctions", type=int, default=MAX_AUCTIONS,
                         help=f"Max auctions to collect (default: {MAX_AUCTIONS})")
+    parser.add_argument("--rescrape-urls", metavar="URL", nargs="+", default=None,
+                        help="Repair mode: re-scrape these listing URLs even if already "
+                             "in bat.csv (replaces their rows and re-pushes to the "
+                             "canonical store). Use when BaT changed a result after "
+                             "the first scrape.")
     args = parser.parse_args()
-    run_scraper(start_date=args.start_date, end_date=args.end_date, max_auctions=args.max_auctions)
+    run_scraper(start_date=args.start_date, end_date=args.end_date,
+                max_auctions=args.max_auctions, rescrape_urls=args.rescrape_urls)
