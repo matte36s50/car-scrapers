@@ -1,0 +1,78 @@
+name: MII Pipeline (compute + publish to S3)
+
+# Runs the full MII computation (enhanced_mii_all_models.py): downloads
+# bat.csv from S3, aggregates model x month, collects social metrics
+# (Google Trends, YouTube, Reddit, Wikipedia — whichever are configured),
+# and uploads mii_results_latest.csv back to the my-mii-reports bucket.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY  — IAM user with read/write on
+#                                                the my-mii-reports bucket
+#   YOUTUBE_API_KEY                            — YouTube Data API v3 key
+#                                                (optional; video sub-signal
+#                                                drops without it)
+#   REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET    — Reddit app credentials
+#                                                (optional; mention/SoV/
+#                                                sentiment sub-signals drop
+#                                                without them)
+#
+# The social caches are persisted between runs via actions/cache so closed
+# months are never re-fetched and the YouTube quota budget accumulates
+# coverage run over run instead of re-spending on the same models.
+
+on:
+  schedule:
+    - cron: '20 6,18 * * *'   # twice daily, 06:20 / 18:20 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mii-pipeline
+  cancel-in-progress: false
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install pandas numpy boto3 pytrends google-api-python-client praw vaderSentiment
+
+      # Restore the newest social caches from any previous run; the save step
+      # below writes a fresh copy keyed by run id so the next run picks it up.
+      - name: Restore social caches
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            social_score_cache.json
+            social_metrics_cache.json
+          key: social-caches-${{ github.run_id }}
+          restore-keys: |
+            social-caches-
+
+      - name: Run MII pipeline
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: us-east-2
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+        run: python enhanced_mii_all_models.py
+
+      - name: Save social caches
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            social_score_cache.json
+            social_metrics_cache.json
+          key: social-caches-${{ github.run_id }}
