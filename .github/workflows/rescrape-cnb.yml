@@ -1,0 +1,69 @@
+name: Rescrape Specific Cars & Bids Listings
+
+# Repair workflow: re-scrapes the given Cars & Bids auction URLs even though
+# they are already in cnb.csv, replacing their rows and re-pushing them to the
+# canonical store. Use when an auction's outcome was recorded wrong — e.g. a
+# "Bid to $X" no-sale (reserve not met) that an older scraper mislabeled as
+# "sold". The corrected scraper now maps "Bid to" to reserve_not_met, and the
+# canonical upsert clears the stale sold-price on the way in.
+#
+# The scraper reads and writes cnb.csv in S3 on its own (download at start,
+# upload at end), so — like the BaT rescrape workflow — no explicit S3 copy
+# steps are needed here; the AWS credentials are all it requires.
+
+on:
+  workflow_dispatch:
+    inputs:
+      urls:
+        description: 'Cars & Bids auction URLs to re-scrape (space-separated)'
+        required: true
+        type: string
+
+jobs:
+  rescrape:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Cache Playwright browsers
+      uses: actions/cache@v3
+      id: playwright-cache
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright-chromium-1091
+        restore-keys: |
+          ${{ runner.os }}-playwright-
+
+    - run: pip install -r requirements.txt
+
+    - name: Install Playwright browsers
+      if: steps.playwright-cache.outputs.cache-hit != 'true'
+      run: playwright install chromium
+
+    - name: Install Playwright deps (cached)
+      if: steps.playwright-cache.outputs.cache-hit == 'true'
+      run: playwright install-deps chromium
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Run CNB scraper in rescrape mode
+      run: python cnb_scraper.py --rescrape-urls ${{ github.event.inputs.urls }}
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    - name: Summary
+      if: always()
+      run: |
+        echo "Rescraped: ${{ github.event.inputs.urls }}"

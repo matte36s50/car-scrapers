@@ -343,7 +343,10 @@ def extract_all_auction_data(page, auction_url):
                         data["sale_type"] = "sold"
                         is_auction_ended = True
                     elif "bid to" in status_text:
-                        data["sale_type"] = "sold"
+                        # On Cars & Bids, "Bid to $X" means the auction ended
+                        # WITHOUT selling — the reserve was not met. This is a
+                        # no-sale, not a sale.
+                        data["sale_type"] = "reserve not met"
                         is_auction_ended = True
                     elif "reserve" in status_text:
                         data["sale_type"] = "reserve not met"
@@ -493,7 +496,8 @@ def extract_all_auction_data(page, auction_url):
         print(f"    ✗ Extraction error: {str(e)[:100]}")
         return data
 
-def main(start_date=None, end_date=None, max_auctions=None):
+def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
+         recheck_sold=False, recheck_limit=None):
     print(f"Starting CNB Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     effective_max = max_auctions if max_auctions is not None else MAX_AUCTIONS_PER_RUN
@@ -505,21 +509,57 @@ def main(start_date=None, end_date=None, max_auctions=None):
 
     existing_df, existing_urls = download_existing_cnb_csv()
 
-    all_urls = get_sitemap_urls()
+    # Bulk repair: re-verify every C&B row currently recorded as a sale. The
+    # "Bid to $X" (reserve-not-met) bug wrote sale_type='sold' for both real
+    # sales and no-sales, so the two are indistinguishable in stored data — the
+    # only way to tell them apart is to re-scrape. Genuine sales re-confirm as
+    # sold (no change); "Bid to" no-sales flip to reserve_not_met with the
+    # corrected scraper, and the canonical upsert clears their stale price.
+    if recheck_sold and not rescrape_urls:
+        sold_mask = existing_df['sale_type'].astype(str).str.contains('sold', case=False, na=False)
+        candidates = existing_df.loc[sold_mask, 'auction_url'].dropna().tolist()
+        candidates = [u for u in candidates if isinstance(u, str) and '/auctions/' in u]
+        # Preserve order, drop duplicates.
+        seen, rescrape_urls = set(), []
+        for u in candidates:
+            if u not in seen:
+                seen.add(u)
+                rescrape_urls.append(u)
+        if recheck_limit:
+            rescrape_urls = rescrape_urls[:recheck_limit]
+        print(f"[RECHECK-SOLD] {len(rescrape_urls)} C&B listing(s) currently marked sold "
+              f"will be re-scraped to correct any 'Bid to' no-sales"
+              + (f" (limited to {recheck_limit})" if recheck_limit else ""))
+        if not rescrape_urls:
+            print("✓ No sold C&B rows found in cnb.csv — nothing to recheck")
+            return True
 
-    if not all_urls:
-        print("✗ Failed to get sitemap URLs!")
-        return False
+    if rescrape_urls:
+        print(f"[RESCRAPE MODE] {len(rescrape_urls)} URL(s) — these will be "
+              f"re-scraped even if already in cnb.csv, and re-pushed to the canonical store")
+        # Repair path: no sitemap collection, no already-scraped filter. The
+        # dedup below keeps the freshly scraped rows (keep='last') so they
+        # replace the old CSV rows, and the canonical push upserts the store's
+        # copy — used when an auction's outcome was recorded wrong (e.g. a
+        # "Bid to" no-sale previously mislabeled as "sold").
+        new_urls = list(rescrape_urls)
+        print(f"Re-scraping {len(new_urls)} supplied URL(s)...")
+    else:
+        all_urls = get_sitemap_urls()
 
-    new_urls = [url for url in all_urls if url not in existing_urls]
-    print(f"Found {len(new_urls)} new auctions to scrape")
+        if not all_urls:
+            print("✗ Failed to get sitemap URLs!")
+            return False
 
-    if not new_urls:
-        print("✓ No new auctions found - cnb.csv is up to date!")
-        return True
+        new_urls = [url for url in all_urls if url not in existing_urls]
+        print(f"Found {len(new_urls)} new auctions to scrape")
 
-    new_urls = new_urls[:effective_max]
-    print(f"Processing {len(new_urls)} new auctions (max {effective_max} per run)")
+        if not new_urls:
+            print("✓ No new auctions found - cnb.csv is up to date!")
+            return True
+
+        new_urls = new_urls[:effective_max]
+        print(f"Processing {len(new_urls)} new auctions (max {effective_max} per run)")
     
     new_rows = []
     
@@ -638,7 +678,10 @@ def main(start_date=None, end_date=None, max_auctions=None):
         updated_df = pd.concat([existing_df, new_df], ignore_index=True)
         
         before_dedup = len(updated_df)
-        updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep='first')
+        # In rescrape mode the freshly scraped rows are appended last, so
+        # keep='last' lets them overwrite the stale CSV rows for the same URL.
+        dedup_keep = 'last' if rescrape_urls else 'first'
+        updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep=dedup_keep)
         after_dedup = len(updated_df)
         if before_dedup != after_dedup:
             print(f"Removed {before_dedup - after_dedup} duplicates")
@@ -677,9 +720,19 @@ if __name__ == "__main__":
                         help="Only collect auctions ending on or before this date (backfill mode)")
     parser.add_argument("--max-auctions", type=int, default=None,
                         help=f"Max auctions per run (overrides MAX_AUCTIONS_PER_RUN, default: {MAX_AUCTIONS_PER_RUN})")
+    parser.add_argument("--rescrape-urls", metavar="URL", nargs="+", default=None,
+                        help="Re-scrape these specific auction URLs even if already in cnb.csv "
+                             "(repair mode for records whose outcome was recorded wrong)")
+    parser.add_argument("--recheck-sold", action="store_true",
+                        help="Bulk repair: re-scrape every C&B row in cnb.csv currently marked "
+                             "sold, correcting any 'Bid to' no-sales to reserve_not_met")
+    parser.add_argument("--recheck-limit", type=int, default=None,
+                        help="Cap the number of listings re-scraped by --recheck-sold (per run)")
     args = parser.parse_args()
     try:
-        success = main(start_date=args.start_date, end_date=args.end_date, max_auctions=args.max_auctions)
+        success = main(start_date=args.start_date, end_date=args.end_date,
+                       max_auctions=args.max_auctions, rescrape_urls=args.rescrape_urls,
+                       recheck_sold=args.recheck_sold, recheck_limit=args.recheck_limit)
         exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Fatal error: {e}")
