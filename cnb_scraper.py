@@ -343,7 +343,10 @@ def extract_all_auction_data(page, auction_url):
                         data["sale_type"] = "sold"
                         is_auction_ended = True
                     elif "bid to" in status_text:
-                        data["sale_type"] = "sold"
+                        # On Cars & Bids, "Bid to $X" means the auction ended
+                        # WITHOUT selling — the reserve was not met. This is a
+                        # no-sale, not a sale.
+                        data["sale_type"] = "reserve not met"
                         is_auction_ended = True
                     elif "reserve" in status_text:
                         data["sale_type"] = "reserve not met"
@@ -493,33 +496,45 @@ def extract_all_auction_data(page, auction_url):
         print(f"    ✗ Extraction error: {str(e)[:100]}")
         return data
 
-def main(start_date=None, end_date=None, max_auctions=None):
+def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None):
     print(f"Starting CNB Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
     effective_max = max_auctions if max_auctions is not None else MAX_AUCTIONS_PER_RUN
     is_backfill = bool(start_date or end_date)
     if is_backfill:
         print(f"[BACKFILL MODE] Date range: {start_date or 'unset'} → {end_date or 'unset'}")
+    if rescrape_urls:
+        print(f"[RESCRAPE MODE] {len(rescrape_urls)} URL(s) supplied — these will be "
+              f"re-scraped even if already in cnb.csv, and re-pushed to the canonical store")
     start_dt = datetime.datetime.strptime(start_date, "%Y-%m-%d").date() if start_date else None
     end_dt   = datetime.datetime.strptime(end_date,   "%Y-%m-%d").date() if end_date   else None
 
     existing_df, existing_urls = download_existing_cnb_csv()
 
-    all_urls = get_sitemap_urls()
+    if rescrape_urls:
+        # Repair path: no sitemap collection, no already-scraped filter. The
+        # dedup below keeps the freshly scraped rows (keep='last') so they
+        # replace the old CSV rows, and the canonical push upserts the store's
+        # copy — used when an auction's outcome was recorded wrong (e.g. a
+        # "Bid to" no-sale previously mislabeled as "sold").
+        new_urls = list(rescrape_urls)
+        print(f"Re-scraping {len(new_urls)} supplied URL(s)...")
+    else:
+        all_urls = get_sitemap_urls()
 
-    if not all_urls:
-        print("✗ Failed to get sitemap URLs!")
-        return False
+        if not all_urls:
+            print("✗ Failed to get sitemap URLs!")
+            return False
 
-    new_urls = [url for url in all_urls if url not in existing_urls]
-    print(f"Found {len(new_urls)} new auctions to scrape")
+        new_urls = [url for url in all_urls if url not in existing_urls]
+        print(f"Found {len(new_urls)} new auctions to scrape")
 
-    if not new_urls:
-        print("✓ No new auctions found - cnb.csv is up to date!")
-        return True
+        if not new_urls:
+            print("✓ No new auctions found - cnb.csv is up to date!")
+            return True
 
-    new_urls = new_urls[:effective_max]
-    print(f"Processing {len(new_urls)} new auctions (max {effective_max} per run)")
+        new_urls = new_urls[:effective_max]
+        print(f"Processing {len(new_urls)} new auctions (max {effective_max} per run)")
     
     new_rows = []
     
@@ -638,7 +653,10 @@ def main(start_date=None, end_date=None, max_auctions=None):
         updated_df = pd.concat([existing_df, new_df], ignore_index=True)
         
         before_dedup = len(updated_df)
-        updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep='first')
+        # In rescrape mode the freshly scraped rows are appended last, so
+        # keep='last' lets them overwrite the stale CSV rows for the same URL.
+        dedup_keep = 'last' if rescrape_urls else 'first'
+        updated_df = updated_df.drop_duplicates(subset=['auction_url'], keep=dedup_keep)
         after_dedup = len(updated_df)
         if before_dedup != after_dedup:
             print(f"Removed {before_dedup - after_dedup} duplicates")
@@ -677,9 +695,13 @@ if __name__ == "__main__":
                         help="Only collect auctions ending on or before this date (backfill mode)")
     parser.add_argument("--max-auctions", type=int, default=None,
                         help=f"Max auctions per run (overrides MAX_AUCTIONS_PER_RUN, default: {MAX_AUCTIONS_PER_RUN})")
+    parser.add_argument("--rescrape-urls", metavar="URL", nargs="+", default=None,
+                        help="Re-scrape these specific auction URLs even if already in cnb.csv "
+                             "(repair mode for records whose outcome was recorded wrong)")
     args = parser.parse_args()
     try:
-        success = main(start_date=args.start_date, end_date=args.end_date, max_auctions=args.max_auctions)
+        success = main(start_date=args.start_date, end_date=args.end_date,
+                       max_auctions=args.max_auctions, rescrape_urls=args.rescrape_urls)
         exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Fatal error: {e}")
