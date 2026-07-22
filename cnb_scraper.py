@@ -562,6 +562,12 @@ def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
         print(f"Processing {len(new_urls)} new auctions (max {effective_max} per run)")
     
     new_rows = []
+    # For long rescrape/recheck passes: mirror to the canonical store in
+    # batches as we go (matching the every-50-rows CSV checkpoint), so a run
+    # that hits the job timeout still lands its store updates instead of losing
+    # them all. pushed_count tracks how many of new_rows are already mirrored.
+    pushed_count = 0
+    import canonical_store
     
     with sync_playwright() as p:
         browser = p.chromium.launch(
@@ -655,6 +661,11 @@ def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
                     print(f"\n💾 Saving progress ({len(new_rows)} rows)...")
                     temp_df = pd.concat([existing_df, pd.DataFrame(new_rows)], ignore_index=True)
                     upload_updated_cnb_csv(temp_df)
+                    # Mirror the just-scraped batch to the canonical store too,
+                    # so store updates aren't lost if the run is later cut short.
+                    if len(new_rows) > pushed_count:
+                        canonical_store.push_cnb_records(new_rows[pushed_count:])
+                        pushed_count = len(new_rows)
         
         browser.close()
         
@@ -689,11 +700,12 @@ def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
         print(f"{'='*60}")
 
     if new_rows:
-        # Dual-write this run's new records to the canonical store (no-op
-        # unless SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY are set; never breaks
-        # the CSV path)
-        import canonical_store
-        canonical_store.push_cnb_records(new_rows)
+        # Dual-write any records not already mirrored at a progress checkpoint
+        # to the canonical store (no-op unless SUPABASE_URL/
+        # SUPABASE_SERVICE_ROLE_KEY are set; never breaks the CSV path).
+        if len(new_rows) > pushed_count:
+            canonical_store.push_cnb_records(new_rows[pushed_count:])
+            pushed_count = len(new_rows)
 
         print(f"\n💾 Saving {len(new_rows)} new rows...")
         new_df = pd.DataFrame(new_rows)
