@@ -1,0 +1,73 @@
+name: Recheck Cars & Bids Sold Listings (bulk repair)
+
+# Bulk repair for the "Bid to" → sold bug. Re-scrapes every Cars & Bids row in
+# cnb.csv currently marked sold and re-pushes it to the canonical store. Because
+# the old scraper wrote sale_type='sold' for both real sales and "Bid to"
+# no-sales, the two are indistinguishable in stored data — so this rechecks the
+# whole set: genuine sales re-confirm as sold (no change), while reserve-not-met
+# auctions flip to reserve_not_met (price cleared, high bid moved to current_bid)
+# with the corrected scraper.
+#
+# Run it once with a small `limit` (e.g. 25) to sanity-check, then again with no
+# limit for the full pass. The scraper reads and writes cnb.csv in S3 itself.
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Max listings to recheck this run (blank = all sold rows)'
+        required: false
+        type: string
+
+jobs:
+  recheck:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 350
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Cache Playwright browsers
+      uses: actions/cache@v3
+      id: playwright-cache
+      with:
+        path: ~/.cache/ms-playwright
+        key: ${{ runner.os }}-playwright-chromium-1091
+        restore-keys: |
+          ${{ runner.os }}-playwright-
+
+    - run: pip install -r requirements.txt
+
+    - name: Install Playwright browsers
+      if: steps.playwright-cache.outputs.cache-hit != 'true'
+      run: playwright install chromium
+
+    - name: Install Playwright deps (cached)
+      if: steps.playwright-cache.outputs.cache-hit == 'true'
+      run: playwright install-deps chromium
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Recheck sold C&B listings
+      run: |
+        if [ -n "${{ github.event.inputs.limit }}" ]; then
+          python cnb_scraper.py --recheck-sold --recheck-limit ${{ github.event.inputs.limit }}
+        else
+          python cnb_scraper.py --recheck-sold
+        fi
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+
+    - name: Summary
+      if: always()
+      run: echo "Recheck complete (limit=${{ github.event.inputs.limit || 'all' }})"
