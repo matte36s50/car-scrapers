@@ -664,7 +664,30 @@ def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
         print(f"   ⊘ In-progress: {skipped_in_progress}")
         print(f"   ✗ Failed: {failed}")
         print(f"{'='*60}")
-    
+
+    # Recheck flip summary: report which previously-"sold" rows changed outcome
+    # on re-scrape, so a --recheck-sold run is self-verifying from its logs.
+    if recheck_sold and new_rows:
+        old_by_url = {}
+        if {'auction_url', 'sale_type'}.issubset(existing_df.columns):
+            for u, st in zip(existing_df['auction_url'], existing_df['sale_type']):
+                if isinstance(u, str):
+                    old_by_url[u] = str(st).lower()
+        flipped = []
+        for row in new_rows:
+            old = old_by_url.get(row.get('auction_url'), '')
+            new = str(row.get('sale_type') or '').lower()
+            if 'sold' in old and 'sold' not in new:
+                flipped.append((str(row.get('model') or '')[:45], new or 'unknown'))
+        print(f"\n{'='*60}")
+        print(f"[RECHECK-SOLD] {len(flipped)} of {len(new_rows)} re-scraped listing(s) "
+              f"flipped away from 'sold':")
+        for model, new in flipped:
+            print(f"   ⇄ {model} → {new}")
+        if not flipped:
+            print("   (none flipped — all re-scraped listings were genuine sales)")
+        print(f"{'='*60}")
+
     if new_rows:
         # Dual-write this run's new records to the canonical store (no-op
         # unless SUPABASE_URL/SUPABASE_SERVICE_ROLE_KEY are set; never breaks
