@@ -12,13 +12,94 @@ from social_score import compute_social_scores
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-USE_CNB_DATA = False  # Set to True when CNB scraper is fixed
+# Cars & Bids. OFF, and it must stay off until cnb_scraper.py is collecting
+# again: cnb.csv covers 2024-10 → 2025-10 and has added nothing in the eleven
+# months since, though the object is still re-uploaded daily. The MII window
+# runs to the present, so switching this on today would pour ~4,000 lots into
+# five historical months and none into the rest — a step change in the universe
+# partway through the series, which shifts every percentile rank on one side of
+# it and breaks every trend line at October 2025.
+#
+# When the scraper is collecting again, the remaining blockers are model-name
+# alignment (C&B "E9X M3" vs BaT "E90/E92/E93 M3", C&B "3 Series" vs BaT's
+# per-chassis buckets — unmapped names fork new models rather than merging) and
+# a backfill of the gap.
+USE_CNB_DATA = False
 
 # Social Metrics Configuration
 USE_SOCIAL_METRICS = True  # Set to True to collect real social metrics
 SOCIAL_METRICS_SAMPLE = None  # Set to a number to limit models (for testing), None for all
 YOUTUBE_API_KEY = os.environ.get('YOUTUBE_API_KEY')  # Optional: Set for real YouTube data
 # ============================================================================
+
+# ============================================================================
+# UNIVERSE — what the index is allowed to rank
+# ============================================================================
+# Bring a Trailer sells more than cars, and it files all of it under a make and
+# model, so an unfiltered load ranks a $300 steering wheel and a set of patio
+# furniture against an E46 M3. Two rules, because neither is sufficient alone:
+#
+#   * make == "Parts and Automobilia" catches the 2,246 rows BaT files under
+#     that house make — signs, gas pumps, pinball machines, bicycles, trailers.
+#   * category in (Parts, Wheels) catches parts filed under the donor car's own
+#     make, e.g. a BBS wheel set listed as "BMW E30 M3".
+#
+# The category test alone misses 201 automobilia rows that carry a vehicle-ish
+# category (trailers filed under "RVs & Campers", go-karts under "Go-Karts");
+# the make test alone misses every part filed under a real car. Together they
+# are exhaustive on the live feed.
+#   * a model string BaT itself prefixes "Parts and Automobilia –" catches the
+#     last few filed under a real make with a vehicle category — rolling
+#     chassis and engine-only project lots listed as Ford or Factory Five.
+NON_VEHICLE_CATEGORIES = {'parts', 'wheels'}
+NON_VEHICLE_MAKES = {'parts and automobilia'}
+NON_VEHICLE_MODEL_PREFIX = 'parts and automobilia'
+
+# Everything that survives is a vehicle, but not all of it is a car: ~9% of the
+# feed is motorcycles, plus boats, tractors and go-karts. Rather than silently
+# dropping them — which would be a product decision buried in a scraper — each
+# row is LABELLED, so the dashboard can rank cars against cars and the choice
+# stays visible and reversible.
+VEHICLE_CLASS_BY_CATEGORY = {
+    'motorcycles': 'motorcycle',
+    'minibikes & scooters': 'motorcycle',
+    'boats': 'boat',
+    'aircraft': 'aircraft',
+    'tractors': 'tractor',
+    'go-karts': 'kart',
+    'all-terrain vehicles': 'atv',
+    'side-by-sides': 'atv',
+    'rvs & campers': 'rv',
+}
+
+
+def classify_vehicle(category):
+    """Coarse class for a lot, so cars can be ranked against cars."""
+    return VEHICLE_CLASS_BY_CATEGORY.get(str(category or '').strip().lower(), 'car')
+
+
+def drop_non_vehicles(df, source_label):
+    """Remove parts and automobilia, and tag what remains with a vehicle class."""
+    before = len(df)
+    make_col = df['make'] if 'make' in df.columns else pd.Series([''] * len(df), index=df.index)
+    cat_col = df['category'] if 'category' in df.columns else pd.Series([''] * len(df), index=df.index)
+    model_col = df['model'] if 'model' in df.columns else pd.Series([''] * len(df), index=df.index)
+
+    is_non_vehicle = (
+        make_col.fillna('').astype(str).str.strip().str.lower().isin(NON_VEHICLE_MAKES)
+        | cat_col.fillna('').astype(str).str.strip().str.lower().isin(NON_VEHICLE_CATEGORIES)
+        | model_col.fillna('').astype(str).str.strip().str.lower().str.startswith(NON_VEHICLE_MODEL_PREFIX)
+    )
+    df = df[~is_non_vehicle].copy()
+    df['vehicle_class'] = cat_col[~is_non_vehicle].apply(classify_vehicle)
+
+    removed = before - len(df)
+    print(f"   \U0001f9f9 {source_label}: dropped {removed:,} parts/automobilia lots "
+          f"({100 * removed / before:.1f}%), {len(df):,} vehicles remain")
+    for cls, n in df['vehicle_class'].value_counts().items():
+        print(f"      {cls:<12} {n:>7,} ({100 * n / len(df):.1f}%)")
+    return df
+
 
 def upload_to_s3(file_name, bucket, object_name=None):
     """Upload file to S3 bucket"""
@@ -211,6 +292,7 @@ def load_scraped_data():
         df['data_source'] = 'BAT'
         
         print(f"   📋 Raw BAT data: {len(df)} records")
+        df = drop_non_vehicles(df, 'BAT')
         
         # Extract price from sale_amount
         if 'sale_amount' in df.columns:
@@ -279,12 +361,17 @@ def load_scraped_data():
     # Load CNB data if enabled
     if USE_CNB_DATA:
         try:
+            # cnb_scraper.py writes cnb.csv. This previously read
+            # cnb_sitemap_full_cleaned.csv, a one-off export last touched in
+            # July 2025 — so enabling the flag would have ingested a stale
+            # snapshot rather than the live feed.
             print(f"📊 Downloading cnb.csv from S3...")
-            s3.download_file('my-mii-reports', 'cnb_sitemap_full_cleaned.csv', 'temp_cnb.csv')
+            s3.download_file('my-mii-reports', 'cnb.csv', 'temp_cnb.csv')
             df = pd.read_csv('temp_cnb.csv')
             df['data_source'] = 'CNB'
             
             print(f"   📋 Raw CNB data: {len(df)} records")
+            df = drop_non_vehicles(df, 'CNB')
             
             if 'sale_amount' in df.columns:
                 df['price'] = df['sale_amount'].apply(extract_price)
@@ -297,7 +384,14 @@ def load_scraped_data():
                 df['bids_numeric'] = df['bids'].apply(extract_numeric)
                 df['bids'] = df['bids_numeric']
             
-            df['comments'] = 0
+            # cnb.csv carries a real comments count on every row. Hard-coding
+            # zero here did not make the input "missing" — a present zero is
+            # percentile-ranked at the bottom, so every C&B car would have been
+            # pushed to last place on a 12%-effective-weight input.
+            if 'comments' in df.columns:
+                df['comments'] = df['comments'].apply(extract_numeric)
+            else:
+                df['comments'] = np.nan
             
             if 'sale_type' in df.columns:
                 df['sold'] = (df['sale_type'] == 'sold').astype(int)
@@ -483,6 +577,7 @@ def calculate_mii_scores(df):
         decade=('decade', 'first'),
         sold=('sold', 'sum'),
         data_source=('data_source', 'first'),
+        vehicle_class=('vehicle_class', 'first'),
         auction_count=('price', 'count'),
     ).reset_index()
 
