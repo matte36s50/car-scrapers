@@ -58,12 +58,21 @@ jobs:
         aws-region: us-east-1
 
     - name: Run CNB scraper in rescrape mode
-      run: python cnb_scraper.py --rescrape-urls ${{ github.event.inputs.urls }}
+      run: |
+        set -euo pipefail
+        # Unquoted on purpose: the scraper takes several space-separated URLs.
+        # Word-splitting a variable does NOT re-parse its contents as shell, so
+        # this cannot execute what an input contains; -f disables globbing.
+        set -f
+        python cnb_scraper.py --rescrape-urls $URLS
       env:
+        URLS: ${{ github.event.inputs.urls }}
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
 
     - name: Summary
+      env:
+        URLS: ${{ github.event.inputs.urls }}
       if: always()
       run: |
-        echo "Rescraped: ${{ github.event.inputs.urls }}"
+        echo "Rescraped: $URLS"
