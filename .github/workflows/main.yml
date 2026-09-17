@@ -91,7 +91,18 @@ jobs:
         echo "=========================================="
         echo "Starting Cars & Bids scraper..."
         echo "=========================================="
-        python cnb_scraper.py || echo "CNB scraper encountered errors"
+        # Record the outcome instead of discarding it. The old form
+        # (`python cnb_scraper.py || echo "..."`) turned every non-zero exit
+        # into a successful echo, so a scraper that discovered no auctions at
+        # all still produced a green step.
+        if python cnb_scraper.py; then
+          echo "cnb_exit=0" >> "$GITHUB_OUTPUT"
+        else
+          code=$?
+          echo "cnb_exit=$code" >> "$GITHUB_OUTPUT"
+          echo "::warning ::Cars & Bids scraper exited $code — see the freshness gate at the end of this run"
+        fi
+      id: cnb
       env:
         # Canonical-store dual-write (Phase 2). Leave these secrets unset to
         # keep the scraper CSV-only; set them to mirror into the store.
@@ -103,8 +114,19 @@ jobs:
       if: always()
       run: |
         if [ -f cnb.csv ]; then
-          aws s3 cp cnb.csv s3://my-mii-reports/cnb.csv
-          echo "✓ Uploaded cnb.csv to S3 ($(wc -l < cnb.csv) rows)"
+          # Re-uploading an unchanged file advanced the S3 object's
+          # Last-Modified every day, which is how a feed that had collected
+          # nothing since October 2025 kept looking fresh to every consumer.
+          local_sum=$(md5sum cnb.csv | cut -d' ' -f1)
+          remote_sum=$(aws s3api head-object --bucket my-mii-reports --key cnb.csv \
+                        --query 'ETag' --output text 2>/dev/null | tr -d '"' || echo "none")
+          if [ "$local_sum" = "$remote_sum" ]; then
+            echo "↔ cnb.csv unchanged ($(wc -l < cnb.csv) rows) — skipping upload so the"
+            echo "  object's timestamp keeps reflecting when data last actually changed."
+          else
+            aws s3 cp cnb.csv s3://my-mii-reports/cnb.csv
+            echo "✓ Uploaded cnb.csv to S3 ($(wc -l < cnb.csv) rows)"
+          fi
         else
           echo "⚠️ No cnb.csv file found to upload"
         fi
@@ -233,6 +255,33 @@ jobs:
           *.txt
         retention-days: 7
         
+    # Runs last on purpose: a dead feed should be loud, but it should not stop
+    # the healthy feed or the MII rebuild from completing first.
+    - name: Data freshness gate
+      if: always()
+      run: |
+        echo "=========================================="
+        echo "Checking that each feed is still collecting"
+        echo "=========================================="
+        status=0
+        python check_feed_freshness.py bat.csv --max-age-days 3 \
+          --label "Bring a Trailer" || status=1
+        # Cars & Bids is known-stale (stopped collecting 2025-10). Until the
+        # scraper is repaired this gate is expected to fail, and that is the
+        # point: the run should not read green while a source is dead.
+        python check_feed_freshness.py cnb.csv --max-age-days 14 \
+          --label "Cars & Bids" || status=1
+        # Empty means the step never got far enough to record an outcome, which
+        # is itself worth reporting — but distinguish it from a real exit code.
+        cnb_exit="${{ steps.cnb.outputs.cnb_exit }}"
+        if [ -z "$cnb_exit" ]; then
+          echo "::warning ::Cars & Bids scraper recorded no exit code — did the step run?"
+        elif [ "$cnb_exit" != "0" ]; then
+          echo "::error ::Cars & Bids scraper exited $cnb_exit"
+          status=1
+        fi
+        exit $status
+
     - name: Summary
       if: always()
       run: |
