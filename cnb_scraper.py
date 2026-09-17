@@ -88,12 +88,16 @@ def upload_updated_cnb_csv(df):
 # Incremental mode for GitHub Actions
 SLEEP_BETWEEN_AUCTIONS = 2.0 if os.getenv('GITHUB_ACTIONS') == 'true' else 3.0
 MAX_AUCTIONS_PER_RUN = int(os.getenv('MAX_AUCTIONS_PER_RUN', '100' if os.getenv('GITHUB_ACTIONS') == 'true' else '300'))
+# How deep to walk /past-auctions/, and how many URLs are worth gathering
+# relative to the per-run scrape budget.
+MAX_LISTING_PAGES = int(os.getenv('MAX_LISTING_PAGES', '40'))
+URL_TARGET_MULTIPLE = int(os.getenv('URL_TARGET_MULTIPLE', '4'))
 
 print(f"Running in {'GitHub Actions' if os.getenv('GITHUB_ACTIONS') else 'local'} mode")
 print(f"Max auctions per run: {MAX_AUCTIONS_PER_RUN}")
 print(f"Sleep between auctions: {SLEEP_BETWEEN_AUCTIONS}s")
 
-def get_sitemap_urls():
+def get_sitemap_urls(url_target=None):
     """Get CNB auction URLs - BROWSER-BASED (sitemap is blocked)"""
     print("Fetching CNB auction URLs...")
 
@@ -203,31 +207,37 @@ def get_sitemap_urls():
 
             time.sleep(3)
 
-            # Scroll multiple times to load more auctions
-            print("Scrolling to load more auctions...")
-            prev_count = 0
-            for i in range(20):
-                page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                time.sleep(1.5)
+            # Walk the paginator.
+            #
+            # /past-auctions/ is PAGINATED, not infinitely scrolled. Scrolling
+            # loads nothing further, which is why discovery returned exactly
+            # one page — 90 anchors, 50 unique auctions — however many times it
+            # scrolled, and why eleven months of backlog stayed unreachable.
+            # The page exposes a .paginator with a "next" arrow; follow it.
+            urls = set()
 
-                # Check if we've loaded more
-                links = page.query_selector_all("a[href*='/auctions/']")
-                curr_count = len(links)
-                if curr_count > prev_count:
-                    print(f"  Scroll {i+1}: {curr_count} links loaded")
-                    prev_count = curr_count
-                elif i > 5:
-                    # Stop if no new links after 5 attempts
-                    break
+            def harvest():
+                found = 0
+                for link in page.query_selector_all("a[href*='/auctions/']"):
+                    href = link.get_attribute("href")
+                    if not href or "/auctions/" not in href:
+                        continue
+                    if any(x in href for x in ['/past-auctions', '/live-auctions', '/search']):
+                        continue
+                    if href.startswith("/"):
+                        href = "https://carsandbids.com" + href
+                    if re.match(r'https://carsandbids\.com/auctions/[a-zA-Z0-9-]+', href):
+                        if href not in urls:
+                            urls.add(href)
+                            found += 1
+                return found
 
-            # Collect all auction URLs
-            links = page.query_selector_all("a[href*='/auctions/']")
+            harvest()
 
-            # When the selector matches nothing, record what the page actually
+            # When the first page yields nothing, say what the page actually
             # was. A Cloudflare interstitial, a redirect and a redesigned
-            # listing page are three different problems that all present as
-            # "0 auction URLs", and the old code could not tell them apart.
-            if not links:
+            # listing page all present as "0 auction URLs" otherwise.
+            if not urls:
                 try:
                     print(f"  ⚠ no matches for a[href*='/auctions/']")
                     print(f"    landed on : {page.url}")
@@ -237,20 +247,29 @@ def get_sitemap_urls():
                     print(f"    body starts: {body!r}")
                 except Exception as e:
                     print(f"    (could not describe the page: {e})")
+            else:
+                print(f"  page 1: {len(urls)} auction URLs")
 
-            urls = set()
-
-            for link in links:
-                href = link.get_attribute("href")
-                if href and "/auctions/" in href:
-                    # Skip non-auction pages
-                    if any(x in href for x in ['/past-auctions', '/live-auctions', '/search']):
-                        continue
-                    if href.startswith("/"):
-                        href = "https://carsandbids.com" + href
-                    # Only include actual auction URLs (should have a slug after /auctions/)
-                    if re.match(r'https://carsandbids\.com/auctions/[a-zA-Z0-9-]+', href):
-                        urls.add(href)
+            for page_no in range(2, MAX_LISTING_PAGES + 1):
+                if url_target and len(urls) >= url_target:
+                    print(f"  stopping: {len(urls)} URLs is enough for this run")
+                    break
+                next_btn = page.query_selector("li.arrow.next button")
+                if not next_btn or not next_btn.is_enabled():
+                    print(f"  no further pages after page {page_no - 1}")
+                    break
+                try:
+                    next_btn.click()
+                    page.wait_for_selector(".auction-item", timeout=20_000)
+                    time.sleep(1.5)
+                except Exception as e:
+                    print(f"  pagination stopped at page {page_no}: {e}")
+                    break
+                added = harvest()
+                print(f"  page {page_no}: +{added} (total {len(urls)})")
+                if added == 0:
+                    print("  page yielded nothing new — stopping")
+                    break
 
             browser.close()
 
@@ -303,6 +322,26 @@ def extract_number_from_text(text):
         return int(match.group(1))
     return 0
 
+def derive_model_from_title(title, make=None, year=None):
+    """Best-effort model name from an auction title.
+
+    Only a fallback. Cars & Bids publishes Make and Model as their own rows in
+    the listing's spec list, and those are authoritative — a title like
+    "2022 Ford Bronco Badlands 4-Door" carries trim and body style that would
+    fork a new model bucket for every variant. This strips the leading year and
+    make so the fallback at least lands in the same neighbourhood.
+    """
+    text = (title or "").strip()
+    if not text:
+        return ""
+    text = re.sub(r'^\s*(19|20)\d{2}\s+', '', text)
+    if year:
+        text = re.sub(r'^\s*' + re.escape(str(int(year))) + r'\s+', '', text)
+    if make:
+        text = re.sub(r'^\s*' + re.escape(str(make)) + r'\s+', '', text, flags=re.IGNORECASE)
+    return text.strip()
+
+
 def extract_all_auction_data(page, auction_url):
     """Extract comprehensive data from CNB auction page - UPDATED SELECTORS"""
 
@@ -335,20 +374,26 @@ def extract_all_auction_data(page, auction_url):
         page.wait_for_selector("body", timeout=15000)
         time.sleep(2)
 
-        # Extract title from .auction-title h1 or fallback to h1
+        # Title is held aside, NOT written into `model`. It used to be assigned
+        # straight to data["model"], and because the spec-list handler below
+        # only filled `model` when it was still empty, the title always won and
+        # the real Model row was discarded. That is why rows came back as
+        # "2022 Ford Bronco" instead of "Bronco", forking a new model bucket
+        # per trim and never joining the BaT series.
+        page_title = ""
         try:
             title_element = page.query_selector(".auction-title h1")
             if not title_element:
                 title_element = page.query_selector("h1")
             if title_element:
-                data["model"] = clean_text(title_element.inner_text())
+                page_title = clean_text(title_element.inner_text())
         except:
             pass
 
-        # Extract year from URL or model text
+        # Extract year from URL or the title
         data["year"] = extract_year_from_url(auction_url)
-        if not data["year"] and data["model"]:
-            year_match = re.search(r'\b(19|20)\d{2}\b', data["model"])
+        if not data["year"] and page_title:
+            year_match = re.search(r'\b(19|20)\d{2}\b', page_title)
             if year_match:
                 data["year"] = int(year_match.group(0))
 
@@ -485,7 +530,10 @@ def extract_all_auction_data(page, auction_url):
                                 if key == "make":
                                     data["make"] = value
                                 elif key == "model":
-                                    data["model"] = value if not data["model"] else data["model"]
+                                    # Authoritative. Plain assignment, matching
+                                    # `make` directly above — the previous
+                                    # conditional made this a no-op.
+                                    data["model"] = value
                                 elif key == "vin":
                                     data["vin"] = value
                                 elif key == "engine":
@@ -510,6 +558,31 @@ def extract_all_auction_data(page, auction_url):
                         continue
         except Exception as e:
             pass
+
+        # Fallback only — the spec list above is authoritative when present.
+        if not data["model"] and page_title:
+            data["model"] = derive_model_from_title(
+                page_title, data.get("make"), data.get("year"))
+
+        # Comment count. It used to sit in ul.stats alongside Bids and Views,
+        # and 7,538 of the 8,375 stored rows carry a non-zero value from when
+        # it did — but the row is gone from the current page, so every row
+        # scraped since reads 0. A present zero is not the same as "unknown":
+        # comments is a 10% MII input, and percentile ranking puts a zero last
+        # rather than dropping it, so every C&B car would be pinned to the
+        # bottom of that axis. Read the comments heading as a fallback, and
+        # leave the field empty (not 0) when it genuinely cannot be found, so
+        # the MII drops the input for that row instead of scoring it worst.
+        if not data["comments"]:
+            try:
+                body_text = page.inner_text("body") or ""
+                m = re.search(r'(\d[\d,]*)\s+Comments?\b', body_text, re.IGNORECASE)
+                if m:
+                    data["comments"] = extract_number_from_text(m.group(1))
+                else:
+                    data["comments"] = ""
+            except Exception:
+                data["comments"] = ""
 
         # Auto-detect make from model if not found
         if not data["make"] and data["model"]:
@@ -595,7 +668,9 @@ def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
         new_urls = list(rescrape_urls)
         print(f"Re-scraping {len(new_urls)} supplied URL(s)...")
     else:
-        all_urls = get_sitemap_urls()
+        # Gather several times the scrape budget so a backfill keeps moving
+        # without paging the entire archive on every routine run.
+        all_urls = get_sitemap_urls(url_target=effective_max * URL_TARGET_MULTIPLE)
 
         if not all_urls:
             print("✗ Failed to get sitemap URLs!")
