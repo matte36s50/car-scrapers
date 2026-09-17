@@ -115,25 +115,59 @@ def get_sitemap_urls():
             soup = BeautifulSoup(response.text, "xml")
             locs = soup.find_all("loc")
 
-            # Find auctions sitemap
-            auction_sitemap = None
+            # Pick the child sitemaps to follow.
+            #
+            # This used to take the FIRST <loc> containing the substring
+            # "auctions" and stop there. The index lists
+            # https://carsandbids.com/past-auctions/ — an HTML page, not a
+            # sitemap — and "past-auctions" contains "auctions", so it always
+            # won. The scraper then fetched 5.6KB of HTML, parsed it as XML,
+            # found no <loc> elements, and fell through to Playwright with
+            # nothing. That is how discovery returned zero every run from
+            # October 2025 onward.
+            #
+            # So: require something that actually looks like a sitemap, never
+            # an HTML page, and follow ALL of them rather than the first hit.
+            candidates = []
             for loc in locs:
-                if "auctions" in loc.text.lower():
-                    auction_sitemap = loc.text
-                    break
+                href = loc.text.strip()
+                low = href.lower()
+                looks_like_sitemap = low.endswith(('.xml', '.xml.gz')) or 'sitemap' in low
+                if looks_like_sitemap and href != sitemap_url:
+                    candidates.append(href)
 
-            if auction_sitemap:
-                print(f"✓ Found auctions sitemap: {auction_sitemap}")
-                response = requests.get(auction_sitemap, headers=headers, timeout=15)
-                if response.status_code == 200:
-                    print(f"✓ Got auctions sitemap ({len(response.text)} chars)")
-                    soup = BeautifulSoup(response.text, "xml")
-                    locs = soup.find_all("loc")
-                    urls = [loc.text.strip() for loc in locs if "/auctions/" in loc.text]
+            # Log the whole index when nothing qualifies — the next run then
+            # says what C&B is actually publishing instead of failing mutely.
+            if not candidates:
+                print(f"⚠ No child sitemaps in the index. It lists {len(locs)} URL(s):")
+                for loc in locs[:20]:
+                    print(f"    {loc.text.strip()}")
+            else:
+                print(f"✓ Found {len(candidates)} child sitemap(s) to follow")
 
-                    if urls:
-                        print(f"✓ Found {len(urls)} auction URLs via sitemap")
-                        return urls
+            urls = []
+            seen = set()
+            for child in candidates:
+                try:
+                    response = requests.get(child, headers=headers, timeout=15)
+                except Exception as e:
+                    print(f"  ⚠ {child}: {e}")
+                    continue
+                if response.status_code != 200:
+                    print(f"  ⚠ {child}: HTTP {response.status_code}")
+                    continue
+                child_soup = BeautifulSoup(response.text, "xml")
+                child_locs = child_soup.find_all("loc")
+                found = [l.text.strip() for l in child_locs if "/auctions/" in l.text]
+                print(f"  {child}: {len(child_locs)} <loc>, {len(found)} auction URL(s)")
+                for u in found:
+                    if u not in seen:
+                        seen.add(u)
+                        urls.append(u)
+
+            if urls:
+                print(f"✓ Found {len(urls)} auction URLs via sitemap")
+                return urls
         else:
             print(f"⚠ Sitemap returned {response.status_code}")
     except Exception as e:
@@ -188,6 +222,22 @@ def get_sitemap_urls():
 
             # Collect all auction URLs
             links = page.query_selector_all("a[href*='/auctions/']")
+
+            # When the selector matches nothing, record what the page actually
+            # was. A Cloudflare interstitial, a redirect and a redesigned
+            # listing page are three different problems that all present as
+            # "0 auction URLs", and the old code could not tell them apart.
+            if not links:
+                try:
+                    print(f"  ⚠ no matches for a[href*='/auctions/']")
+                    print(f"    landed on : {page.url}")
+                    print(f"    page title: {page.title()!r}")
+                    print(f"    total <a> on page: {len(page.query_selector_all('a'))}")
+                    body = (page.inner_text('body') or '')[:400].replace('\n', ' ')
+                    print(f"    body starts: {body!r}")
+                except Exception as e:
+                    print(f"    (could not describe the page: {e})")
+
             urls = set()
 
             for link in links:
