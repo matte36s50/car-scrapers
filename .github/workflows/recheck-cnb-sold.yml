@@ -59,8 +59,9 @@ jobs:
 
     - name: Recheck sold C&B listings
       run: |
-        if [ -n "${{ github.event.inputs.limit }}" ]; then
-          python cnb_scraper.py --recheck-sold --recheck-limit ${{ github.event.inputs.limit }}
+        if [ -n "$LIMIT" ]; then
+          [[ "$LIMIT" =~ ^[0-9]+$ ]] || { echo "::error ::limit must be a whole number; got '$LIMIT'"; exit 1; }
+          python cnb_scraper.py --recheck-sold --recheck-limit "$LIMIT"
         else
           python cnb_scraper.py --recheck-sold
         fi
@@ -70,4 +71,6 @@ jobs:
 
     - name: Summary
       if: always()
-      run: echo "Recheck complete (limit=${{ github.event.inputs.limit || 'all' }})"
+      env:
+        LIMIT: ${{ github.event.inputs.limit }}
+      run: echo "Recheck complete (limit=${LIMIT:-all})"

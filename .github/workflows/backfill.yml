@@ -64,12 +64,32 @@ jobs:
         aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
         aws-region: us-east-1
 
+    # Dispatch inputs reach bash through env, never through ${{ }} interpolation.
+    # An expression is substituted into the script BEFORE bash parses it, so a
+    # backtick or $(...) in an input is read as shell, not as text — on a runner
+    # holding AWS and Supabase credentials. A mistyped date ("2026-09-1`7")
+    # already broke this step once; the same hole executes commands.
     - name: Build CLI args
       id: args
+      env:
+        START_DATE: ${{ github.event.inputs.start_date }}
+        END_DATE: ${{ github.event.inputs.end_date }}
+        MAX_AUCTIONS: ${{ github.event.inputs.max_auctions }}
       run: |
-        A="--start-date ${{ github.event.inputs.start_date }} --end-date ${{ github.event.inputs.end_date }}"
-        [ -n "${{ github.event.inputs.max_auctions }}" ] && A="$A --max-auctions ${{ github.event.inputs.max_auctions }}"
-        echo "cli=$A" >> $GITHUB_OUTPUT
+        set -euo pipefail
+        for v in "$START_DATE" "$END_DATE"; do
+          [[ "$v" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || {
+            echo "::error ::Dates must be YYYY-MM-DD; got '$v'"; exit 1; }
+        done
+        if [ -n "$MAX_AUCTIONS" ]; then
+          [[ "$MAX_AUCTIONS" =~ ^[0-9]+$ ]] || {
+            echo "::error ::max_auctions must be a whole number; got '$MAX_AUCTIONS'"; exit 1; }
+        fi
+        A="--start-date $START_DATE --end-date $END_DATE"
+        if [ -n "$MAX_AUCTIONS" ]; then
+          A="$A --max-auctions $MAX_AUCTIONS"
+        fi
+        echo "cli=$A" >> "$GITHUB_OUTPUT"
 
     - name: Run BAT scraper
       if: ${{ github.event.inputs.source == 'bat' || github.event.inputs.source == 'both' }}
@@ -88,6 +108,10 @@ jobs:
       continue-on-error: true
 
     - name: Summary
+      env:
+        SOURCE: ${{ github.event.inputs.source }}
+        START_DATE: ${{ github.event.inputs.start_date }}
+        END_DATE: ${{ github.event.inputs.end_date }}
       if: always()
       run: |
-        echo "Backfill complete: ${{ github.event.inputs.source }} | ${{ github.event.inputs.start_date }} → ${{ github.event.inputs.end_date }}"
+        echo "Backfill complete: $SOURCE | $START_DATE → $END_DATE"
