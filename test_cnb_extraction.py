@@ -99,6 +99,28 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         os.chdir(here)
 
+print("\nsaving never drops what another run saved meanwhile")
+mine = pd.DataFrame([{"auction_url": "u/a", "sale_type": "sold"}, {"auction_url": "u/b", "sale_type": "sold"}])
+theirs = pd.DataFrame([{"auction_url": "u/a", "sale_type": "OLD"}, {"auction_url": "u/c", "sale_type": "sold", "watchers": 3}])
+merged = cnb_scraper.merge_with_current(mine, theirs)
+check("a listing only the other run has is kept", sorted(merged["auction_url"]), ["u/a", "u/b", "u/c"])
+check("where both have one, this run's row wins", merged.set_index("auction_url").loc["u/a", "sale_type"], "sold")
+check("nothing to merge leaves the frame as it was", cnb_scraper.merge_with_current(mine, None) is mine, True)
+
+with tempfile.TemporaryDirectory() as d:
+    here = os.getcwd()
+    os.chdir(d)
+    try:
+        s3 = mock.Mock()
+        s3.download_file.side_effect = lambda b, k, f: theirs.to_csv(f, index=False)
+        with mock.patch.object(cnb_scraper.boto3, "client", return_value=s3), \
+                mock.patch("sys.stdout", new=io.StringIO()):
+            cnb_scraper.upload_updated_cnb_csv(mine)
+        check("the uploaded file includes the other run's listing",
+              sorted(pd.read_csv("cnb.csv")["auction_url"]), ["u/a", "u/b", "u/c"])
+    finally:
+        os.chdir(here)
+
 print("\nrestoring what the canonical store kept")
 existing = pd.DataFrame([
     {"model": "M2", "make": "BMW", "auction_url": "https://carsandbids.com/auctions/a/2019-bmw-m2",

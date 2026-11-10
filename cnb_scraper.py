@@ -58,11 +58,38 @@ def download_existing_cnb_csv():
             print(f"Error downloading cnb.csv: {e}")
             raise
 
+def merge_with_current(df, current):
+    """`df` with any listing `current` has and `df` lacks added in. Where both
+    have a listing, `df`'s row wins."""
+    if current is None or current.empty or 'auction_url' not in current.columns:
+        return df
+    have = set(df['auction_url'].dropna()) if 'auction_url' in df.columns else set()
+    extra = current[~current['auction_url'].isin(have)]
+    if extra.empty:
+        return df
+    columns = list(df.columns) + [c for c in extra.columns if c not in df.columns]
+    return pd.concat([df, extra], ignore_index=True)[columns]
+
+
 def upload_updated_cnb_csv(df):
-    """Upload updated cnb.csv back to S3"""
+    """Upload updated cnb.csv back to S3.
+
+    Merged first with cnb.csv as it is in S3 NOW, not as this run downloaded
+    it. A backfill runs for hours while the twice-daily pipeline saves its
+    own copy; without this, each save threw away whatever the other had
+    added since it started."""
     s3 = boto3.client('s3')
-    
+
     try:
+        try:
+            s3.download_file(S3_BUCKET, CNB_CSV_FILENAME, TEMP_LOCAL_FILE)
+            current = pd.read_csv(TEMP_LOCAL_FILE)
+            before = len(df)
+            df = merge_with_current(df, current)
+            if len(df) > before:
+                print(f"Kept {len(df) - before} row(s) another run saved to cnb.csv meanwhile")
+        except Exception as e:
+            print(f"(could not re-read cnb.csv before saving: {e}; saving this run's copy)")
         df.to_csv(TEMP_LOCAL_FILE, index=False)
         
         try:
@@ -105,8 +132,15 @@ print(f"Running in {'GitHub Actions' if os.getenv('GITHUB_ACTIONS') else 'local'
 print(f"Max auctions per run: {MAX_AUCTIONS_PER_RUN}")
 print(f"Sleep between auctions: {SLEEP_BETWEEN_AUCTIONS}s")
 
-def get_sitemap_urls(url_target=None):
-    """Get CNB auction URLs - BROWSER-BASED (sitemap is blocked)"""
+def get_sitemap_urls(url_target=None, known=None):
+    """Get CNB auction URLs - BROWSER-BASED (sitemap is blocked)
+
+    Newest first, in the order the site lists them. `url_target` counts only
+    URLs not in `known` (the ones cnb.csv already has): the paginator starts
+    at the newest auctions, so counting every URL would stop a backfill
+    before it got past the months cnb.csv already covers.
+    """
+    known = known or set()
     print("Fetching CNB auction URLs...")
 
     # METHOD 1: Try sitemap first (usually blocked but worth trying)
@@ -222,7 +256,13 @@ def get_sitemap_urls(url_target=None):
             # one page — 90 anchors, 50 unique auctions — however many times it
             # scrolled, and why eleven months of backlog stayed unreachable.
             # The page exposes a .paginator with a "next" arrow; follow it.
-            urls = set()
+            # A list, not a set: a set loses the newest-first order, and the
+            # backfill's date filter stops after ten auctions in a row older
+            # than start_date, which in a shuffled list can come at any time.
+            urls, seen_urls = [], set()
+
+            def fresh():
+                return sum(1 for u in urls if u not in known)
 
             def harvest():
                 found = 0
@@ -235,8 +275,9 @@ def get_sitemap_urls(url_target=None):
                     if href.startswith("/"):
                         href = "https://carsandbids.com" + href
                     if re.match(r'https://carsandbids\.com/auctions/[a-zA-Z0-9-]+', href):
-                        if href not in urls:
-                            urls.add(href)
+                        if href not in seen_urls:
+                            seen_urls.add(href)
+                            urls.append(href)
                             found += 1
                 return found
 
@@ -259,8 +300,8 @@ def get_sitemap_urls(url_target=None):
                 print(f"  page 1: {len(urls)} auction URLs")
 
             for page_no in range(2, MAX_LISTING_PAGES + 1):
-                if url_target and len(urls) >= url_target:
-                    print(f"  stopping: {len(urls)} URLs is enough for this run")
+                if url_target and fresh() >= url_target:
+                    print(f"  stopping: {fresh()} URLs not yet in cnb.csv is enough for this run")
                     break
                 next_btn = page.query_selector("li.arrow.next button")
                 if not next_btn or not next_btn.is_enabled():
@@ -281,7 +322,6 @@ def get_sitemap_urls(url_target=None):
 
             browser.close()
 
-            urls = list(urls)
             print(f"✓ Found {len(urls)} auction URLs from past auctions page")
             return urls
 
@@ -755,7 +795,7 @@ def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
     else:
         # Gather several times the scrape budget so a backfill keeps moving
         # without paging the entire archive on every routine run.
-        all_urls = get_sitemap_urls(url_target=effective_max * URL_TARGET_MULTIPLE)
+        all_urls = get_sitemap_urls(url_target=effective_max * URL_TARGET_MULTIPLE, known=existing_urls)
 
         if not all_urls:
             print("✗ Failed to get sitemap URLs!")
