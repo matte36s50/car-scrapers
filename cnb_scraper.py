@@ -307,12 +307,24 @@ def get_sitemap_urls(url_target=None, known=None):
                 if not next_btn or not next_btn.is_enabled():
                     print(f"  no further pages after page {page_no - 1}")
                     break
+                # Wait for the listing to change, not for a class name: this
+                # waited for ".auction-item", which the page doesn't use, so
+                # every run timed out here and saw only the newest 50 auctions.
+                # A page has turned once an auction link appears that wasn't
+                # there before the click.
                 try:
                     next_btn.click()
-                    page.wait_for_selector(".auction-item", timeout=20_000)
-                    time.sleep(1.5)
+                    page.wait_for_function(
+                        """(seen) => [...document.querySelectorAll("a[href*='/auctions/']")]
+                            .some(a => {
+                                const m = a.href.match(/\\/auctions\\/([A-Za-z0-9]+)\\//);
+                                return m && !seen.includes(m[1]);
+                            })""",
+                        arg=sorted(auction_ids(seen_urls)), timeout=30_000)
+                    time.sleep(1.0)
                 except Exception as e:
-                    print(f"  pagination stopped at page {page_no}: {e}")
+                    print(f"  pagination stopped at page {page_no}: {str(e)[:200]}")
+                    print(f"    landed on: {page.url}")
                     break
                 added = harvest()
                 print(f"  page {page_no}: +{added} (total {len(urls)})")
@@ -329,6 +341,14 @@ def get_sitemap_urls(url_target=None, known=None):
         print(f"✗ Past auctions page failed: {e}")
         traceback.print_exc()
         return []
+
+AUCTION_ID = re.compile(r'/auctions/([A-Za-z0-9]+)/')
+
+
+def auction_ids(urls):
+    """The listing ids ('3v0W1D5b') of Cars & Bids auction URLs."""
+    return {m.group(1) for m in (AUCTION_ID.search(u or '') for u in urls) if m}
+
 
 def extract_year_from_url(url):
     """Extract year from CNB URL patterns"""

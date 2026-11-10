@@ -99,6 +99,13 @@ with tempfile.TemporaryDirectory() as d:
     finally:
         os.chdir(here)
 
+print("\nturning a page of past auctions")
+check("listing ids, ignoring slugs, queries and other pages",
+      cnb_scraper.auction_ids(["https://carsandbids.com/auctions/3v0W1D5b/2004-porsche-911?x=1",
+                               "https://carsandbids.com/auctions/KYlz5JEw/2006-bmw-z4",
+                               "https://carsandbids.com/past-auctions/", None]),
+      {"3v0W1D5b", "KYlz5JEw"})
+
 print("\nsaving never drops what another run saved meanwhile")
 mine = pd.DataFrame([{"auction_url": "u/a", "sale_type": "sold"}, {"auction_url": "u/b", "sale_type": "sold"}])
 theirs = pd.DataFrame([{"auction_url": "u/a", "sale_type": "OLD"}, {"auction_url": "u/c", "sale_type": "sold", "watchers": 3}])
