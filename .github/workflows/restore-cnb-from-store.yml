@@ -1,0 +1,50 @@
+name: Restore Cars & Bids rows from the canonical store (one-off repair)
+
+# From 2025-10-24 the daily pipeline uploaded cnb.csv as it stood BEFORE each
+# run on top of what the scraper had just saved, so cnb.csv stopped growing
+# (fixed in main.yml and cnb_scraper.py). The scraper also mirrors every record
+# to the canonical store, whole, and that write was never lost: the store holds
+# everything scraped since the mirror began in July 2026.
+#
+# This puts those rows back into cnb.csv. It scrapes nothing. A listing cnb.csv
+# already has is left as it is, so running it twice changes nothing the second
+# time. Rows scraped before 2026-09-17 carry the listing title as their model
+# and a comment count that was never read; they get the model without its year
+# and make, and an empty comment count (cnb_scraper.merge_store_rows). The
+# scraper backs up the existing cnb.csv under backups/ before it uploads.
+#
+# Auctions that ended between 2025-10-24 and July 2026 are in neither place.
+# Those need the Backfill workflow (source: cnb).
+
+on:
+  workflow_dispatch:
+
+jobs:
+  restore:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - run: pip install -r requirements.txt
+
+    - uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Offline tests
+      run: python test_cnb_extraction.py
+
+    - name: Restore
+      run: python cnb_scraper.py --restore-from-store
+      env:
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}

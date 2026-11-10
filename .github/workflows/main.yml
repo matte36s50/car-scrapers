@@ -99,17 +99,24 @@ jobs:
         SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       continue-on-error: true
       
-    - name: Upload CNB results to S3
+    # No "Upload CNB results to S3" step: cnb_scraper.py uploads cnb.csv itself
+    # and leaves the same file here for the MII step. This job used to copy its
+    # own cnb.csv to S3 at this point, which was still the copy downloaded
+    # above, so it replaced the scraper's upload with the file as it stood
+    # before the run. cnb.csv gained nothing from this pipeline from
+    # 2025-10-24, when that step was pointed at the scraper's own S3 key
+    # (e640477). The canonical store, the scraper's second write since July
+    # 2026, kept its rows.
+    - name: Report CNB results
       if: always()
       run: |
         if [ -f cnb.csv ]; then
-          aws s3 cp cnb.csv s3://my-mii-reports/cnb.csv
-          echo "✓ Uploaded cnb.csv to S3 ($(wc -l < cnb.csv) rows)"
+          echo "cnb.csv: $(wc -l < cnb.csv) rows"
         else
-          echo "⚠️ No cnb.csv file found to upload"
+          echo "⚠️ No cnb.csv in the working directory"
         fi
       continue-on-error: true
-      
+
     - name: Wait between scrapers
       run: |
         echo "Waiting 60 seconds before BAT scraper..."
