@@ -103,6 +103,10 @@ jobs:
       if: ${{ github.event.inputs.source == 'cnb' || github.event.inputs.source == 'both' }}
       run: python cnb_scraper.py ${{ steps.args.outputs.cli }}
       env:
+        # /past-auctions/ lists 50 auctions a page, newest first, so a month
+        # is about 14 pages; the daily default of 40 never gets past the last
+        # three months.
+        MAX_LISTING_PAGES: '400'
         SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
         SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
       continue-on-error: true
