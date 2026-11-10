@@ -77,8 +77,16 @@ def upload_updated_cnb_csv(df):
         
         s3.upload_file(TEMP_LOCAL_FILE, S3_BUCKET, CNB_CSV_FILENAME)
         print(f"Successfully uploaded updated cnb.csv to S3 ({len(df)} total rows)")
-        
-        os.remove(TEMP_LOCAL_FILE)
+
+        # Leave what was just uploaded in the working directory as cnb.csv.
+        # main.yml downloads cnb.csv before this script runs, and the MII step
+        # reads that local file afterwards. Until this line existed the local
+        # copy stayed as it was downloaded, and main.yml's "Upload CNB results"
+        # step sent that stale copy back to S3 on top of this upload: every
+        # row scraped by the daily pipeline from 2025-10-24 was lost within a
+        # minute of being saved (bat_scraper.py writes bat.csv locally, which
+        # is why Bring a Trailer never had the problem).
+        os.replace(TEMP_LOCAL_FILE, CNB_CSV_FILENAME)
         return True
         
     except Exception as e:
@@ -340,6 +348,57 @@ def derive_model_from_title(title, make=None, year=None):
     if make:
         text = re.sub(r'^\s*' + re.escape(str(make)) + r'\s+', '', text, flags=re.IGNORECASE)
     return text.strip()
+
+
+def merge_store_rows(existing_df, store_rows):
+    """Put back the rows this scraper saved to the canonical store but that
+    cnb.csv does not have.
+
+    Every scraped record is mirrored to the store as it was scraped
+    (canonical_store.map_cnb_record keeps the whole dict), so the store still
+    holds what main.yml's stale re-upload removed from cnb.csv. A URL already
+    in cnb.csv is left as it is; of two store rows for one URL the later
+    scrape wins.
+
+    Rows scraped before 2026-09-17 carry the listing title as their model
+    ("2022 Ford Bronco") and a comment count of 0 that was never read from
+    the page. Those get what the scraper writes today when a page has no
+    Model row or comment count: the title without its year and make, and an
+    empty comment count rather than a zero.
+
+    Returns (updated_df, restored, repaired).
+    """
+    have = set(existing_df['auction_url'].dropna()) if 'auction_url' in existing_df.columns else set()
+    latest = {}
+    for row in store_rows:
+        if not isinstance(row, dict):
+            continue
+        url = row.get('auction_url')
+        if not isinstance(url, str) or '/auctions/' not in url or url in have:
+            continue
+        kept = latest.get(url)
+        if kept is None or str(row.get('scraped_date') or '') >= str(kept.get('scraped_date') or ''):
+            latest[url] = row
+
+    restored, repaired = [], 0
+    for row in latest.values():
+        row = dict(row)
+        model = str(row.get('model') or '')
+        if re.match(r'^\s*(19|20)\d{2}\s', model):
+            row['model'] = derive_model_from_title(model, row.get('make'), row.get('year'))
+            if str(row.get('comments') if row.get('comments') is not None else '').strip() in ('', '0', '0.0'):
+                row['comments'] = ''
+            repaired += 1
+        restored.append(row)
+
+    if not restored:
+        return existing_df, 0, 0
+    new_df = pd.DataFrame(restored)
+    # cnb.csv's own columns first and in their order; a column only the store
+    # rows carry goes last.
+    columns = list(existing_df.columns) + [c for c in new_df.columns if c not in existing_df.columns]
+    updated = pd.concat([existing_df, new_df], ignore_index=True)[columns]
+    return updated, len(restored), repaired
 
 
 def extract_all_auction_data(page, auction_url):
@@ -619,6 +678,32 @@ def extract_all_auction_data(page, auction_url):
         print(f"    ✗ Extraction error: {str(e)[:100]}")
         return data
 
+def restore_from_store():
+    """One-off repair: put the rows the canonical store holds back into
+    cnb.csv (see merge_store_rows). Scrapes nothing."""
+    import canonical_store
+    existing_df, _ = download_existing_cnb_csv()
+    store_rows = canonical_store.fetch_cnb_scraped_rows()
+    print(f"[RESTORE] {len(store_rows)} scraped C&B row(s) in the canonical store, "
+          f"{len(existing_df)} row(s) in cnb.csv")
+    updated_df, restored, repaired = merge_store_rows(existing_df, store_rows)
+    if not restored:
+        print("✓ cnb.csv already has every row the store holds — nothing to restore")
+        return True
+    print(f"[RESTORE] {restored} row(s) missing from cnb.csv will be put back "
+          f"({repaired} with the model taken from the listing title and no comment count)")
+    by_month = pd.to_datetime(updated_df['sale_date'].iloc[len(existing_df):], errors='coerce',
+                              format='mixed').dt.strftime('%Y-%m').value_counts().sort_index()
+    for month, n in by_month.items():
+        print(f"   {month}: {n}")
+    updated_df = updated_df.sort_values('year', ascending=False, na_position='last')
+    if upload_updated_cnb_csv(updated_df):
+        print(f"\n✅ cnb.csv restored: {len(updated_df)} rows")
+        return True
+    print("\n✗ Failed to upload")
+    return False
+
+
 def main(start_date=None, end_date=None, max_auctions=None, rescrape_urls=None,
          recheck_sold=False, recheck_limit=None):
     print(f"Starting CNB Scraper - {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -888,11 +973,17 @@ if __name__ == "__main__":
                              "sold, correcting any 'Bid to' no-sales to reserve_not_met")
     parser.add_argument("--recheck-limit", type=int, default=None,
                         help="Cap the number of listings re-scraped by --recheck-sold (per run)")
+    parser.add_argument("--restore-from-store", action="store_true",
+                        help="One-off repair: put back the rows this scraper saved to the "
+                             "canonical store but cnb.csv lost. Scrapes nothing")
     args = parser.parse_args()
     try:
-        success = main(start_date=args.start_date, end_date=args.end_date,
-                       max_auctions=args.max_auctions, rescrape_urls=args.rescrape_urls,
-                       recheck_sold=args.recheck_sold, recheck_limit=args.recheck_limit)
+        if args.restore_from_store:
+            success = restore_from_store()
+        else:
+            success = main(start_date=args.start_date, end_date=args.end_date,
+                           max_auctions=args.max_auctions, rescrape_urls=args.rescrape_urls,
+                           recheck_sold=args.recheck_sold, recheck_limit=args.recheck_limit)
         exit(0 if success else 1)
     except Exception as e:
         print(f"\n✗ Fatal error: {e}")

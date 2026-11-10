@@ -325,6 +325,33 @@ def push_records(records, mapper, label):
         return 0
 
 
+def fetch_cnb_scraped_rows(page_size=1000):
+    """Every Cars & Bids record cnb_scraper.py has mirrored here, as the dict
+    it scraped (map_cnb_record keeps it under payload.raw). For
+    cnb_scraper.py --restore-from-store. Unlike the pushes this raises: a
+    restore that read half the store must not pass for a whole one."""
+    if not configured():
+        raise RuntimeError("SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are not set")
+    url = os.environ["SUPABASE_URL"].rstrip("/")
+    key = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
+    rows, offset = [], 0
+    while True:
+        req = urllib.request.Request(
+            f"{url}/rest/v1/auction_listings_all?select=raw:raw_payload->raw"
+            f"&source_id=eq.carsandbids&entered_by=eq.scraper&order=id.asc"
+            f"&limit={page_size}&offset={offset}")
+        req.add_header("apikey", key)
+        req.add_header("Authorization", f"Bearer {key}")
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            page = json.loads(resp.read().decode())
+        # Until a page comes back empty: the server may cap a page below
+        # page_size, so a short page is not the last one.
+        if not page:
+            return rows
+        rows += [r["raw"] for r in page if isinstance(r.get("raw"), dict)]
+        offset += len(page)
+
+
 def push_bat_records(records):
     return push_records(records, map_bat_record, "BaT")
 
